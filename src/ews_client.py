@@ -177,6 +177,21 @@ class EWSClient:
             self._account.protocol.close()
             self._account = None
 
+    def reset(self) -> None:
+        """Drop the cached account so the next access reconnects from scratch.
+
+        Used by the ConnectionManager's recovery ladder: the corporate
+        Exchange sometimes wedges exchangelib's once-per-process auth-type
+        probe; renegotiating on a genuinely fresh session is the only way
+        out. Closing errors are swallowed — the session may already be dead.
+        """
+        if self._account is not None:
+            try:
+                self._account.protocol.close()
+            except Exception as exc:
+                self.logger.debug(f"reset: ignoring close error: {exc}")
+            self._account = None
+
     def get_account(self, target_mailbox: Optional[str] = None) -> Account:
         """
         Get Exchange account, optionally for a different mailbox.

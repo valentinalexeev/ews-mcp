@@ -70,6 +70,10 @@ def _commitment_to_response(c: Commitment) -> Dict[str, Any]:
 
 
 class TrackCommitmentTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "track_commitment",
@@ -131,6 +135,10 @@ class TrackCommitmentTool(BaseTool):
 
 
 class ListCommitmentsTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "list_commitments",
@@ -172,6 +180,10 @@ class ListCommitmentsTool(BaseTool):
 
 
 class ResolveCommitmentTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "resolve_commitment",

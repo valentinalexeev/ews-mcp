@@ -210,6 +210,10 @@ async def _apply_actions(
 
 
 class RuleCreateTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "rule_create",
@@ -257,6 +261,10 @@ class RuleCreateTool(BaseTool):
 
 
 class RuleListTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "rule_list",
@@ -280,6 +288,10 @@ class RuleListTool(BaseTool):
 
 
 class RuleDeleteTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "rule_delete",
@@ -304,6 +316,10 @@ class RuleDeleteTool(BaseTool):
 
 
 class RuleSimulateTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "rule_simulate",

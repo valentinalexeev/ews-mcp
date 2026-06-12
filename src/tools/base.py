@@ -23,6 +23,12 @@ class BaseTool(ABC):
     # the default is the conservative ``"write"``.
     side_effect_class: str = "write"
 
+    # Whether this tool needs a live Exchange connection. Tools that only
+    # touch local state (whoami config mode, memory store, approval queue
+    # bookkeeping) override with False so they keep working while the
+    # background warmup is still trying to reach Exchange.
+    requires_ews: bool = True
+
     def __init__(self, ews_client: EWSClient):
         self.ews_client = ews_client
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -91,6 +97,33 @@ class BaseTool(ABC):
             cb.check()
         except ToolExecutionError as e:
             return format_error_response(e, "")
+
+        # Cold-start gate: while the background warmup has never reached
+        # Exchange, EWS-touching tools fail fast with a retry hint instead
+        # of burning a thread on a connection that isn't there yet. Local
+        # tools (requires_ews=False) pass through. A *degraded* (was-warm)
+        # connection still attempts the call — the circuit breaker owns
+        # repeated-failure protection.
+        manager = getattr(self.ews_client, "connection_manager", None)
+        if (
+            self.requires_ews
+            and manager is not None
+            and manager.state == "connecting"
+        ):
+            status = manager.status()
+            retry_in = status.get("next_retry_in_s")
+            err = ToolExecutionError(
+                f"{tool_name} unavailable: the Exchange connection is still "
+                f"warming up (attempt {status.get('attempts', 0)}; last error: "
+                f"{status.get('last_error') or 'none yet'}). Retry "
+                f"{'in ~' + str(retry_in) + 's' if retry_in is not None else 'shortly'}, "
+                "or call whoami with probe_connection=false for server status."
+            )
+            self._log_error(
+                "UpstreamUnavailable", tool_name, module_name, kwargs, err,
+                int((time.time() - start_time) * 1000),
+            )
+            return format_error_response(err, "")
 
         # Global send kill switch: refuse trust-boundary-leaving operations
         # when SEND_ENABLED=false, before the attempt log and before

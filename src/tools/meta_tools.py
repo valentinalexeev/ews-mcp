@@ -15,6 +15,10 @@ from ..utils import format_success_response
 class WhoamiTool(BaseTool):
     """Identity, backend, capability and health self-report (read-only)."""
 
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
+
     side_effect_class = "read"
 
     def __init__(self, ews_client, tools_registry: Optional[Dict[str, "BaseTool"]] = None):
@@ -69,6 +73,10 @@ class WhoamiTool(BaseTool):
         is_exchange_online = "office365.com" in server_l or "outlook.com" in server_l
 
         connection: Dict[str, Any] = {"probed": probe}
+        manager = getattr(self.ews_client, "connection_manager", None)
+        if manager is not None:
+            # Background warmup/heartbeat state — no network call needed.
+            connection["managed"] = manager.status()
         if probe:
             try:
                 account = self.get_account(target_mailbox)

@@ -47,6 +47,10 @@ def _validate_email(value: str) -> str:
 
 
 class ConfigureOOFPolicyTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "configure_oof_policy",
@@ -130,6 +134,10 @@ class ConfigureOOFPolicyTool(BaseTool):
 
 
 class GetOOFPolicyTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "get_oof_policy",

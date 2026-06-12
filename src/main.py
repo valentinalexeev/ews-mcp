@@ -19,6 +19,7 @@ from starlette.routing import Route
 
 from .config import get_settings
 from .auth import AuthHandler
+from .connection_manager import ConnectionManager
 from .ews_client import EWSClient
 from .middleware.logging import setup_logging, AuditLogger
 from .middleware.error_handler import ErrorHandler
@@ -454,6 +455,10 @@ class EWSMCPServer:
         # OpenAPI adapter (initialized after tools are registered)
         self.openapi_adapter = None
 
+        # Connection lifecycle manager (created in run(); None in tests that
+        # exercise tools directly — BaseTool treats absent manager as warm)
+        self.connection_manager = None
+
         # Register handlers
         self._register_handlers()
 
@@ -837,52 +842,48 @@ class EWSMCPServer:
             self.logger.info(f"User: {self.settings.ews_email}")
             self.logger.info(f"Auth: {self.settings.ews_auth_type}")
 
-            # Test connection
-            self.logger.info("Testing Exchange connection...")
-            if not self.ews_client.test_connection():
-                self.logger.error("Failed to connect to Exchange server")
-                self.logger.error("Please check your configuration and credentials")
-
-                # Log connection failure
-                self.log_manager.log_activity(
-                    level="ERROR",
-                    module="main",
-                    action="CONNECTION_FAILED",
-                    data={"server": self.settings.ews_server_url or "autodiscover"},
-                    result={"status": "failed"},
-                    context={"auth_type": self.settings.ews_auth_type}
-                )
-                return
-
-            self.logger.info("✓ Successfully connected to Exchange")
-
-            # Log successful connection
-            self.log_manager.log_activity(
-                level="INFO",
-                module="main",
-                action="CONNECTION_SUCCESS",
-                data={"server": self.settings.ews_server_url or "autodiscover"},
-                result={"status": "connected"},
-                context={"auth_type": self.settings.ews_auth_type}
-            )
-
-            # Register tools
+            # Register tools FIRST — the server must be fully functional
+            # (tools listed, HTTP up, /readyz reporting) even when Exchange
+            # is unreachable. The corporate Exchange answers exchangelib's
+            # fresh-connection auth probe unreliably; exiting on a failed
+            # startup connection test made every fresh deploy a coin flip
+            # while warm processes kept working. Connection is now owned by
+            # a background warmup loop that retries forever with backoff.
             self.register_tools()
 
-            # Bug 4: kick off the semantic-search warmup as a background
-            # task so the server accepts traffic immediately. The warmup
-            # pre-fills the embedding cache from Inbox + Sent top-N so the
-            # first few semantic_search_emails calls don't spend 45-76s
-            # embedding on demand.
-            if (
-                getattr(self.settings, "enable_ai", False)
-                and getattr(self.settings, "enable_semantic_search", False)
-                and getattr(self.settings, "enable_embedding_warmup", True)
-            ):
-                try:
-                    asyncio.create_task(self._run_embedding_warmup())
-                except Exception as exc:
-                    self.logger.warning(f"Failed to schedule embedding warmup: {exc}")
+            # Bug 4 follow-up: the semantic-search embedding warmup needs a
+            # live Exchange connection, so it now rides the ConnectionManager
+            # on_warm callback instead of racing the first connect.
+            async def _on_warm() -> None:
+                if (
+                    getattr(self.settings, "enable_ai", False)
+                    and getattr(self.settings, "enable_semantic_search", False)
+                    and getattr(self.settings, "enable_embedding_warmup", True)
+                ):
+                    try:
+                        asyncio.create_task(self._run_embedding_warmup())
+                    except Exception as exc:
+                        self.logger.warning(
+                            f"Failed to schedule embedding warmup: {exc}"
+                        )
+
+            self.connection_manager = ConnectionManager(
+                self.ews_client,
+                max_backoff=float(
+                    getattr(self.settings, "ews_warmup_max_backoff_seconds", 300)
+                ),
+                heartbeat_seconds=int(
+                    getattr(self.settings, "ews_heartbeat_seconds", 600)
+                ),
+            )
+            # Tools and transports reach the manager through the client —
+            # avoids threading it through 73 tool constructors.
+            self.ews_client.connection_manager = self.connection_manager
+            await self.connection_manager.start(on_warm=_on_warm)
+            self.logger.info(
+                "Exchange connection warming up in background "
+                "(server starts regardless; see /readyz)"
+            )
 
             # Log server ready
             self.log_manager.log_activity(
@@ -1252,6 +1253,54 @@ class EWSMCPServer:
                         "type": "http.response.body",
                         "body": health_body,
                     })
+                    return
+
+                # Liveness: the process and event loop are alive. Public.
+                if path == "/livez" and method == "GET":
+                    livez_body = b'{"status":"ok"}'
+                    await send({
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"content-length", str(len(livez_body)).encode()],
+                        ],
+                    })
+                    await send({"type": "http.response.body", "body": livez_body})
+                    return
+
+                # Readiness: 200 only when the Exchange connection is warm;
+                # otherwise 503 with the structured degraded-state report so
+                # a stuck deploy is diagnosable from curl alone. Public —
+                # state metadata only, no mailbox content. k8s-style.
+                if path == "/readyz" and method == "GET":
+                    manager = self.connection_manager
+                    if manager is None:
+                        ready_status, payload = 200, {
+                            "status": "ok",
+                            "connection": {"state": "unmanaged"},
+                        }
+                    else:
+                        conn = manager.status()
+                        if conn["state"] == "warm":
+                            ready_status, payload = 200, {
+                                "status": "ok", "connection": conn,
+                            }
+                        else:
+                            ready_status, payload = 503, {
+                                "status": "unavailable", "connection": conn,
+                            }
+                    payload["tools"] = len(self.tools)
+                    readyz_body = safe_json_dumps(payload).encode("utf-8")
+                    await send({
+                        "type": "http.response.start",
+                        "status": ready_status,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"content-length", str(len(readyz_body)).encode()],
+                        ],
+                    })
+                    await send({"type": "http.response.body", "body": readyz_body})
                     return
 
                 # All other endpoints require auth when MCP_API_KEY is set

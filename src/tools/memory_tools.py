@@ -36,6 +36,10 @@ def _reject_reserved(namespace: str) -> None:
 class MemorySetTool(BaseTool):
     """Agent scratch-write: persist a JSON value against a key."""
 
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "memory_set",
@@ -99,6 +103,10 @@ class MemorySetTool(BaseTool):
 
 
 class MemoryGetTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "memory_get",
@@ -136,6 +144,10 @@ class MemoryGetTool(BaseTool):
 
 
 class MemoryListTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "memory_list",
@@ -172,6 +184,10 @@ class MemoryListTool(BaseTool):
 
 
 class MemoryDeleteTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "memory_delete",

@@ -44,6 +44,10 @@ def _summary(action: str, args: Dict[str, Any]) -> str:
 
 
 class SubmitForApprovalTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "submit_for_approval",
@@ -116,6 +120,10 @@ class SubmitForApprovalTool(BaseTool):
 
 
 class ListPendingApprovalsTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "list_pending_approvals",
@@ -151,6 +159,10 @@ class ListPendingApprovalsTool(BaseTool):
 
 
 class ApproveTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "approve",
@@ -196,6 +208,10 @@ class ApproveTool(BaseTool):
 
 
 class RejectTool(BaseTool):
+
+    # Local/state-only (or self-error-handling) tool: usable while the
+    # background Exchange warmup is still connecting.
+    requires_ews = False
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "reject",

@@ -100,6 +100,21 @@ class Settings(BaseSettings):
     connection_pool_size: int = 10
     request_timeout: int = 30
 
+    # --- Connection lifecycle (never-exit startup) -----------------------
+    # The corporate Exchange answers exchangelib's auth-type probe
+    # unreliably for fresh connections, so startup never gates on a
+    # successful connect: a background warmup loop retries with
+    # exponential backoff + jitter (capped below), and a periodic
+    # heartbeat re-probes a warm connection (0 disables the heartbeat).
+    ews_warmup_max_backoff_seconds: int = Field(
+        default=300,
+        description="Cap for the warmup loop's exponential backoff (seconds).",
+    )
+    ews_heartbeat_seconds: int = Field(
+        default=600,
+        description="Interval for the warm-connection liveness probe; 0 disables.",
+    )
+
     # Rate limiting
     rate_limit_enabled: bool = True
     rate_limit_requests_per_minute: int = 25
