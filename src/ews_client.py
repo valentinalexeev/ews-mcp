@@ -168,9 +168,20 @@ class EWSClient:
             # Try a simple operation
             _ = self.account.inbox.total_count
             self.logger.info("Connection test successful")
+            self.last_connection_error = None
             return True
         except Exception as e:
             self.logger.error(f"Connection test failed: {e}")
+            # Keep the underlying cause for /readyz and whoami — a bare
+            # bool hides the diagnosis (RetryError chains especially).
+            cause = getattr(e, "last_attempt", None)
+            detail = str(e)
+            if cause is not None:
+                try:
+                    detail = str(cause.exception())
+                except Exception:
+                    pass
+            self.last_connection_error = f"{type(e).__name__}: {detail}"
             return False
 
     def close(self) -> None:

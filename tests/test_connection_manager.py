@@ -98,6 +98,29 @@ def test_warmup_first_try_success_no_resets():
     asyncio.run(scenario())
 
 
+def test_false_probe_surfaces_client_error_detail():
+    class _FalseClient:
+        last_connection_error = "EWSConnectionError: Failed to get auth type from service"
+
+        def test_connection(self):
+            return False
+
+        def reset(self):
+            pass
+
+    async def scenario():
+        manager = _manager(_FalseClient(), initial_backoff=5.0, max_backoff=5.0)
+        await manager.start()
+        for _ in range(100):
+            if manager.status()["attempts"] >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert "auth type" in (manager.status()["last_error"] or "")
+        await manager.stop()
+
+    asyncio.run(scenario())
+
+
 def test_status_while_connecting_reports_error_and_retry():
     async def scenario():
         client = _FlakyClient(fail_times=10_000)

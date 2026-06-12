@@ -150,7 +150,10 @@ class ConnectionManager:
         try:
             ok = self._client.test_connection()
             if not ok:
-                self._mark_failure("connection test returned False")
+                self._mark_failure(
+                    getattr(self._client, "last_connection_error", None)
+                    or "connection test returned False"
+                )
             return ok
         except Exception as exc:
             self._mark_failure(f"{type(exc).__name__}: {exc}")
