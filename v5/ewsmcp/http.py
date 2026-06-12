@@ -9,7 +9,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__
 from .errors import HTTP_BY_CODE
-from .server import build_context, build_mcp_server, start_connection_manager, status_payload
+from .server import build_context, build_mcp_server, start_connection_manager
 from .tools.base import dispatch
 
 logger = logging.getLogger(__name__)

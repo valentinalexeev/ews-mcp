@@ -5,7 +5,6 @@ Driven with ``asyncio.run`` against ``dispatch()`` directly.
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any, Dict
 
 from conftest import make_settings

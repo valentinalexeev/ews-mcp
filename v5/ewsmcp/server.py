@@ -1,13 +1,11 @@
 """MCP wiring: low-level Server, annotations, structured output, lifecycle."""
 
-import asyncio
 import logging
 from typing import Any, Dict, List
 
 from mcp.server import Server
 from mcp.types import Tool, ToolAnnotations
 
-from . import __version__
 from .audit import AuditLog
 from .config import Settings
 from .gateway.client import EWSGateway
@@ -93,17 +91,3 @@ async def run_stdio(settings: Settings) -> None:
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 
-
-def status_payload(ctx: Context) -> Dict[str, Any]:
-    import time
-    conn = ctx.manager.status() if ctx.manager else {"state": "unmanaged"}
-    return {
-        "version": __version__,
-        "uptime_s": int(time.time() - ctx.started_at),
-        "connection": conn,
-        "tier": ctx.settings.ews_capability_tier,
-        "send_kill_switch": not ctx.settings.send_enabled,
-        "tools": len(ctx.registry),
-        "counters": dict(ctx.counters),
-        "alias_stats": ctx.aliaser.stats(),
-    }
