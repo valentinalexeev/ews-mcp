@@ -1030,6 +1030,16 @@ class ReadEmailsTool(BaseTool):
                         "description": "Only return unread emails",
                         "default": False
                     },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Pagination offset; pair with the response's next_offset",
+                        "default": 0
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict response items to these fields (default: light list fields, no body)"
+                    },
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to read from (requires impersonation/delegate access)"
@@ -1039,11 +1049,23 @@ class ReadEmailsTool(BaseTool):
         }
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
-        """Read emails from folder."""
+        """Read emails from folder.
+
+        Rewritten onto the classified-pagination path (`_paginate_query`)
+        that search_emails already uses: the old direct
+        ``items[:max_results]`` iteration swallowed mid-iteration errors
+        (throttling, auth-expiry, transient resets), making "broken"
+        indistinguishable from "empty" — the prod zero-items symptom.
+        Failures now surface as a classified error, partial results carry
+        ``meta.error_code``, and the canonical paged envelope is emitted
+        alongside the legacy ``emails``/``total_count`` keys.
+        """
         folder_name = kwargs.get("folder", "inbox")
         max_results = kwargs.get("max_results", 50)
         unread_only = kwargs.get("unread_only", False)
+        offset = max(0, int(kwargs.get("offset", 0)))
         target_mailbox = kwargs.get("target_mailbox")
+        explicit_fields = kwargs.get("fields")
 
         try:
             # Get account (primary or impersonated)
@@ -1055,47 +1077,97 @@ class ReadEmailsTool(BaseTool):
             self.logger.info(f"Resolved folder '{folder_name}' to: {safe_get(folder, 'name', folder_name)} in mailbox: {mailbox}")
 
             # Build query
-            items = folder.all().order_by('-datetime_received')
-
+            query = folder.all().order_by('-datetime_received')
             if unread_only:
-                items = items.filter(is_read=False)
+                query = query.filter(is_read=False)
 
-            # Fetch emails
-            emails = []
-            for item in items[:max_results]:
-                # Get sender email safely
-                sender = safe_get(item, "sender", None)
-                from_email = ""
-                if sender and hasattr(sender, "email_address"):
-                    from_email = sender.email_address or ""
+            # Field projection keeps FindItem/GetItem light — without it
+            # every list row drags the full property set (incl. body).
+            fields = list(explicit_fields or LIST_DEFAULT_FIELDS)
+            only_fields = _db_fields_for(fields)
+            if only_fields:
+                try:
+                    query = query.only(*only_fields)
+                except Exception as only_exc:
+                    self.logger.debug(
+                        "query.only(%s) rejected: %s", only_fields, only_exc,
+                    )
 
-                # Get text body safely
-                text_body = safe_get(item, "text_body", "") or ""
+            folder_label = safe_get(folder, "name", folder_name)
+            start_time = datetime.now()
+            outcome = _paginate_query(
+                query,
+                max_results=max_results,
+                offset=offset,
+                chunk_size=50,
+                logger=self.logger,
+                folder_label=folder_label,
+            )
+            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+            ews_call_log(
+                self.logger, "FindItem",
+                duration_ms=duration_ms,
+                result_count=len(outcome.items),
+                total_available=outcome.total_available,
+                page_offset=offset,
+                folder=folder_label,
+                outcome="ok" if outcome.error_code is None else outcome.error_code,
+                extra_fields={"tool": "read_emails"},
+            )
 
-                email_data = {
-                    "message_id": ews_id_to_str(safe_get(item, "id", None)) or "unknown",
-                    "subject": safe_get(item, "subject", "") or "",
-                    "from": from_email,
-                    "to": [r.email_address for r in (safe_get(item, "to_recipients", []) or []) if r and hasattr(r, "email_address") and r.email_address],
-                    "cc": [r.email_address for r in (safe_get(item, "cc_recipients", []) or []) if r and hasattr(r, "email_address") and r.email_address],
-                    "bcc": [r.email_address for r in (safe_get(item, "bcc_recipients", []) or []) if r and hasattr(r, "email_address") and r.email_address],
-                    "received_time": safe_get(item, "datetime_received", datetime.now()).isoformat(),
-                    "is_read": safe_get(item, "is_read", False),
-                    "has_attachments": safe_get(item, "has_attachments", False),
-                    "preview": truncate_text(text_body, 200)
-                }
-                emails.append(email_data)
+            # A failure with nothing collected is an error, not an empty
+            # mailbox — the distinction the old code erased.
+            if outcome.error_code and not outcome.items:
+                raise ToolExecutionError(
+                    f"Failed to read emails from '{folder_label}': "
+                    f"{outcome.error_message} [{outcome.error_code}]. "
+                    "Retry, narrow with max_results, or check /readyz."
+                )
+
+            emails: List[Dict[str, Any]] = []
+            for item in outcome.items:
+                card = _build_list_item(item, fields=fields, folder_name=folder_label)
+                if explicit_fields is None:
+                    # Legacy enrichment for pre-envelope consumers.
+                    card.setdefault("preview", card.get("snippet", ""))
+                    for legacy_key, ews_attr in (("cc", "cc_recipients"), ("bcc", "bcc_recipients")):
+                        recipients = safe_get(item, ews_attr, []) or []
+                        card.setdefault(legacy_key, [
+                            r.email_address for r in recipients
+                            if r and hasattr(r, "email_address") and r.email_address
+                        ])
+                emails.append(card)
 
             self.logger.info(f"Retrieved {len(emails)} emails from {folder_name} in mailbox: {mailbox}")
 
+            response: Dict[str, Any] = {
+                "items": emails,
+                "count": len(emails),
+                "total_available": outcome.total_available,
+                # Legacy spellings (one-release deprecation window).
+                "emails": emails,
+                "total_count": len(emails),
+                "folder": folder_name,
+                "mailbox": mailbox,
+            }
+            if (
+                outcome.total_available is not None
+                and len(emails) + offset < outcome.total_available
+            ):
+                response["next_offset"] = offset + len(emails)
+            if outcome.error_code:
+                response["meta"] = {
+                    "error_code": outcome.error_code,
+                    "error_message": outcome.error_message,
+                }
+
             return format_success_response(
                 f"Retrieved {len(emails)} emails",
-                emails=emails,
-                total_count=len(emails),
-                folder=folder_name,
-                mailbox=mailbox
+                **response,
             )
 
+        except ToolExecutionError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to read emails: {e}")
             raise ToolExecutionError(f"Failed to read emails: {e}")
