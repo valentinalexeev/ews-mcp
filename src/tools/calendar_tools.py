@@ -541,6 +541,11 @@ class UpdateAppointmentTool(BaseTool):
 class DeleteAppointmentTool(BaseTool):
     """Tool for deleting calendar appointments."""
 
+    # item.delete() is a HardDelete in exchangelib 5.x — irreversible,
+    # and removing a meeting affects every attendee's calendar.
+    side_effect_class = "destructive"
+    confirm_required = True
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "delete_appointment",
