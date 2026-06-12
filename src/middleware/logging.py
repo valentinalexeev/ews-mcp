@@ -1,7 +1,9 @@
 """Enterprise-level structured logging configuration."""
 
+import hashlib
 import logging
 import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict
@@ -141,10 +143,20 @@ def setup_logging(log_level: str = "INFO") -> None:
 
 
 class AuditLogger:
-    """Enterprise audit logger for compliance and security."""
+    """Enterprise audit logger for compliance and security.
+
+    Records are hash-chained (CloudTrail-style, lightweight): each line
+    carries ``seq``, a prefix of the previous record's hash, and
+    ``h = sha256(prev_hash | core)``. Tampering with or deleting any
+    record breaks every hash after it. The chain restarts at GENESIS on
+    process start (seq=1). Verify with ``scripts/verify_audit_chain.py``.
+    """
 
     def __init__(self):
         self.logger = logging.getLogger("audit")
+        self._chain_lock = threading.Lock()
+        self._prev_hash = "GENESIS"
+        self._seq = 0
 
         # Add dedicated audit log file
         log_dir = resolve_log_dir()
@@ -179,7 +191,16 @@ class AuditLogger:
             safe_details = redact_sensitive(details)
             message += f" | {safe_details}"
 
+        with self._chain_lock:
+            self._seq += 1
+            core = f"{message} | seq={self._seq} | prev={self._prev_hash[:12]}"
+            digest = hashlib.sha256(
+                f"{self._prev_hash}|{core}".encode("utf-8")
+            ).hexdigest()
+            self._prev_hash = digest
+            line = f"{core} | h={digest}"
+
         if success:
-            self.logger.info(message)
+            self.logger.info(line)
         else:
-            self.logger.warning(message)
+            self.logger.warning(line)

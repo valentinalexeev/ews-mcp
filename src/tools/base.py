@@ -1,8 +1,10 @@
 """Base class for all MCP tools."""
 
 import asyncio
+import fnmatch
 import os
 import threading
+from collections import deque
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Type, Optional
@@ -32,6 +34,22 @@ _CLASS_REQUIRED_TIER = {
 # external-recipient warning.
 _RECIPIENT_KEYS = ("to", "cc", "bcc", "attendees", "required_attendees",
                    "optional_attendees")
+
+# Send rate cap: timestamps of recent send-class executions, process-wide.
+_SEND_TIMES: deque = deque()
+_SEND_TIMES_LOCK = threading.Lock()
+_SEND_WINDOW_SECONDS = 3600
+
+
+def _split_patterns(raw: str) -> list:
+    return [p.strip().lower() for p in (raw or "").split(",") if p.strip()]
+
+
+def reset_send_rate_window() -> None:
+    """Test hook: clear the process-wide send-rate window."""
+    with _SEND_TIMES_LOCK:
+        _SEND_TIMES.clear()
+
 
 # Injected into the published schema of every confirm-gated tool so the
 # model knows the two-phase contract without per-tool schema edits.
@@ -258,6 +276,69 @@ class BaseTool(ABC):
                     external.append(recipient)
         return external
 
+    def _gather_recipients(self, kwargs: Dict[str, Any]) -> list:
+        recipients = []
+        for key in _RECIPIENT_KEYS:
+            value = kwargs.get(key)
+            if isinstance(value, str):
+                value = [value]
+            if isinstance(value, list):
+                recipients.extend(
+                    r.lower() for r in value if isinstance(r, str) and "@" in r
+                )
+        return recipients
+
+    def _recipient_guard(self, kwargs: Dict[str, Any]) -> Optional[str]:
+        """Allowlist/denylist check over kwargs-visible recipients.
+
+        Returns a refusal message, or None when clear. Patterns are
+        comma-separated fnmatch globs (e.g. '*@example.com'). Limitation:
+        only recipients visible in the call's arguments are checked —
+        send_draft recipients live in the draft itself.
+        """
+        cfg = self.ews_client.config
+        denylist = _split_patterns(getattr(cfg, "ews_recipient_denylist", "") or "")
+        allowlist = _split_patterns(getattr(cfg, "ews_recipient_allowlist", "") or "")
+        if not denylist and not allowlist:
+            return None
+        recipients = self._gather_recipients(kwargs)
+        for recipient in recipients:
+            if any(fnmatch.fnmatch(recipient, p) for p in denylist):
+                return (
+                    f"recipient '{recipient}' is denylisted on this server "
+                    "(EWS_RECIPIENT_DENYLIST)."
+                )
+        if allowlist:
+            for recipient in recipients:
+                if not any(fnmatch.fnmatch(recipient, p) for p in allowlist):
+                    return (
+                        f"recipient '{recipient}' is not on this server's "
+                        "allowlist (EWS_RECIPIENT_ALLOWLIST)."
+                    )
+        return None
+
+    def _send_rate_guard(self) -> Optional[str]:
+        """Sends-per-hour cap across all send-class tools. Returns a
+        refusal message when the window is full, else records this send."""
+        try:
+            cap = int(getattr(self.ews_client.config, "ews_max_sends_per_hour", 0))
+        except (TypeError, ValueError):
+            cap = 0
+        if cap <= 0:
+            return None
+        now = time.time()
+        with _SEND_TIMES_LOCK:
+            while _SEND_TIMES and now - _SEND_TIMES[0] > _SEND_WINDOW_SECONDS:
+                _SEND_TIMES.popleft()
+            if len(_SEND_TIMES) >= cap:
+                retry_in = int(_SEND_WINDOW_SECONDS - (now - _SEND_TIMES[0]))
+                return (
+                    f"send rate cap reached ({cap}/hour, "
+                    f"EWS_MAX_SENDS_PER_HOUR). Window frees in ~{retry_in}s."
+                )
+            _SEND_TIMES.append(now)
+        return None
+
     def mint_confirm_token(self, kwargs: Dict[str, Any]) -> str:
         """Mint a valid phase-2 token for these exact kwargs.
 
@@ -419,6 +500,18 @@ class BaseTool(ABC):
             self._log_error("TierBlocked", tool_name, module_name, kwargs, err, duration_ms)
             return format_error_response(err, "")
 
+        # Recipient allowlist/denylist for send-class tools — refused
+        # before even the phase-1 preview.
+        if self.side_effect_class == "send":
+            guard_msg = self._recipient_guard(kwargs)
+            if guard_msg is not None:
+                duration_ms = int((time.time() - start_time) * 1000)
+                err = ToolExecutionError(f"{tool_name} refused: {guard_msg}")
+                self._log_error(
+                    "RecipientBlocked", tool_name, module_name, kwargs, err, duration_ms
+                )
+                return format_error_response(err, "")
+
         # Two-phase confirm for irreversible/externally-visible operations:
         # phase 1 (no token) previews and does nothing; phase 2 requires
         # the param-bound token. Runs BEFORE alias resolution so both
@@ -427,6 +520,18 @@ class BaseTool(ABC):
             kwargs, confirm_response = self._confirm_gate(tool_name, kwargs)
             if confirm_response is not None:
                 return confirm_response
+
+        # Send rate cap: this call WILL execute a send (confirm satisfied
+        # or not required) — count it against the hourly window.
+        if self.side_effect_class == "send":
+            rate_msg = self._send_rate_guard()
+            if rate_msg is not None:
+                duration_ms = int((time.time() - start_time) * 1000)
+                err = ToolExecutionError(f"{tool_name} refused: {rate_msg}")
+                self._log_error(
+                    "SendRateCapped", tool_name, module_name, kwargs, err, duration_ms
+                )
+                return format_error_response(err, "")
 
         # Alias resolution: accept short ids (m12, e3, ...) anywhere a
         # tool takes an id. A stale alias is a clean user error with a

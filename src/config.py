@@ -146,6 +146,29 @@ class Settings(BaseSettings):
             "keep working everywhere."
         ),
     )
+    ews_recipient_allowlist: str = Field(
+        default="",
+        description=(
+            "Comma-separated fnmatch globs (e.g. '*@example.com'). When "
+            "non-empty, send-class tools refuse any argument-visible "
+            "recipient not matching a pattern."
+        ),
+    )
+    ews_recipient_denylist: str = Field(
+        default="",
+        description=(
+            "Comma-separated fnmatch globs. Send-class tools refuse any "
+            "argument-visible recipient matching a pattern. Wins over the "
+            "allowlist."
+        ),
+    )
+    ews_max_sends_per_hour: int = Field(
+        default=0,
+        description=(
+            "Hourly cap across all send-class executions; 0 = unlimited "
+            "(historical behavior)."
+        ),
+    )
     ews_capability_tier: Literal["read", "draft", "full"] = Field(
         default="full",
         description=(
