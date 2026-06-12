@@ -30,6 +30,182 @@ On failure:
 { "success": false, "error": "short description (max 200 chars)" }
 ```
 
+## Endpoints
+
+With `MCP_TRANSPORT=sse` the server exposes one HTTP surface carrying both MCP transports plus a REST adapter. When `MCP_API_KEY` is set, every endpoint **except** `/health`, `/livez`, and `/readyz` requires `Authorization: Bearer <key>` (or `X-API-Key: <key>`).
+
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/health` | GET | public | `{status, tools, sse_active_connections}` |
+| `/livez` | GET | public | Liveness — `200 {"status":"ok"}` whenever the process/event loop is up |
+| `/readyz` | GET | public | Readiness — `200` when the Exchange connection is warm, `503` otherwise (see below) |
+| `/mcp` | POST/GET/DELETE | key | MCP **Streamable HTTP** transport (stateless) — for modern MCP clients |
+| `/sse` | GET | key | Legacy MCP HTTP+SSE transport (paired with `/messages`) |
+| `/messages` | POST | key | Message channel for the legacy SSE transport |
+| `/api/tools/<name>` | POST | key | REST execution of any registered tool (JSON body = tool arguments) |
+| `/openapi.json` | GET | key | OpenAPI schema for the REST surface |
+
+### /livez and /readyz
+
+Startup never exits on a failed Exchange connection: tools register and transports bind immediately while a background warmup loop (`src/connection_manager.py`) retries with exponential backoff + full jitter, then a periodic heartbeat re-probes the warm connection. `/livez` answers `200` as soon as the process is up; `/readyz` reports the connection state:
+
+**200 (warm):**
+```json
+{
+  "status": "ok",
+  "connection": {
+    "state": "warm",
+    "attempts": 1,
+    "last_error": null,
+    "last_success_age_s": 12,
+    "next_retry_in_s": null
+  },
+  "tools": 78
+}
+```
+
+**503 (warming up or degraded):**
+```json
+{
+  "status": "unavailable",
+  "connection": {
+    "state": "connecting",            // connecting | warm | degraded
+    "attempts": 7,
+    "last_error": "AutoDiscoverFailed: ...",
+    "last_success_age_s": null,
+    "next_retry_in_s": 42
+  },
+  "tools": 78
+}
+```
+
+While the state is `connecting` (never connected since process start), EWS-touching tools fail fast with a retry hint instead of hanging; local tools and `whoami` (with `probe_connection=false`) keep working. `whoami` reports the same snapshot under `connection.managed`.
+
+Related settings: `EWS_WARMUP_MAX_BACKOFF_SECONDS` (default 300), `EWS_HEARTBEAT_SECONDS` (600; 0 disables), `EWS_RETRY_MAX_WAIT_SECONDS` (300 — exchangelib `FaultTolerance` retry budget for `ErrorServerBusy`/transient 503s), `EWS_OFFLOAD_ENABLED` (true — run EWS tool bodies on a bounded worker pool instead of the event loop), `EWS_MAX_CONCURRENCY` (4 — pool size = max concurrent EWS operations).
+
+## Two-phase confirmation
+
+Irreversible or externally-visible operations are gated by a central two-phase confirm:
+
+1. **Phase 1 — preview.** Call the tool **without** `confirm_token`. Nothing executes; the response is:
+
+```json
+{
+  "success": true,
+  "requires_confirmation": true,
+  "message": "send_email previewed — NOTHING was executed. Review the preview, then call again with the same arguments plus confirm_token to proceed.",
+  "preview": { "to": ["a@example.com"], "subject": "...", "body_preview": "first 200 chars..." },
+  "confirm_token": "eyJhIjoi...{signature}",
+  "expires_at": 1781000000,
+  "ttl_seconds": 600,
+  "warnings": ["external recipients: a@other-domain.com"]
+}
+```
+
+(`warnings` appears only when applicable, e.g. recipients outside the primary mailbox's domain.)
+
+2. **Phase 2 — execute.** Call again with **identical arguments** plus `confirm_token`. The token is a stateless HMAC bound to (mailbox, tool, exact arguments): changing any argument, replaying it on another tool, or exceeding the TTL (default 600 s) makes it verify as stale/expired, and the call fails with a clean validation error telling you to re-preview.
+
+`confirm_token` is injected automatically into the published schema of every gated tool.
+
+| Gating | Tools |
+|---|---|
+| Always | `send_email`, `reply_email`, `forward_email`, `respond_to_meeting`, `delete_appointment` |
+| Conditional | `delete_email` and `delete_messages` (only when `permanent`/`hard_delete` is true), `manage_folder` (only `action: "delete"`), `oof_settings` (only `action: "set"`) |
+| Own flow | `send_draft` — its token is bound to the draft's *content*, so editing the draft invalidates it (see its entry) |
+
+Tokens are signed with `SEND_CONFIRM_SECRET` when set (so they survive restarts); otherwise a per-process secret is used. The approval-queue executor (`execute_approved_action`) pre-confirms through the same HMAC machinery — a human approval mints a valid phase-2 token rather than bypassing the gate.
+
+### Capability tiers
+
+`EWS_CAPABILITY_TIER=read|draft|full` (default `full` = historical behavior) caps which side-effect classes may run:
+
+- `read` — read-only tools.
+- `draft` — adds reversible writes (drafts, flags, moves, soft delete).
+- `full` — adds send and destructive classes.
+
+Above-tier tools are **removed from the registry at startup** and additionally **refused at dispatch** (defense in depth). Run `draft` against a production mailbox you must not send from.
+
+### Recipient guards and rate cap (send-class tools)
+
+- `EWS_RECIPIENT_ALLOWLIST` / `EWS_RECIPIENT_DENYLIST` — comma-separated `fnmatch` globs (e.g. `*@example.com`). When the allowlist is non-empty, any argument-visible recipient not matching it is refused; any recipient matching the denylist is refused (denylist wins). Limitation: only recipients visible in the call's arguments are checked — `send_draft` recipients live in the draft itself.
+- `EWS_MAX_SENDS_PER_HOUR` — hourly cap across **all** send-class executions; `0` (default) = unlimited.
+- `SEND_ENABLED=false` — global kill switch: every send-class tool refuses before any network call.
+
+### Audit chain
+
+Every `audit.log` record is hash-chained (`h = sha256(prev_hash | core)` with `seq`/`prev` fields), so an edited or deleted record breaks every hash after it. Verify with:
+
+    python scripts/verify_audit_chain.py logs/audit.log
+
+### Tool annotations
+
+`list_tools` publishes MCP tool annotations derived from each tool's side-effect class: `read` → `readOnlyHint`/`idempotentHint`, `destructive` → `destructiveHint`, `send` → `destructiveHint` + `openWorldHint`. These are hints for clients; the server-side gates above remain the real boundary.
+
+## Short ids (sid)
+
+Raw EWS ItemIds are ~100–150 case-sensitive characters and silently change when an item moves folders. With `EWS_ID_ALIASES_ENABLED=true` (default), the server maintains short aliases:
+
+- Every long EWS id in a tool output gains a sibling `"sid"` (`m12`, `e3`, `d4`, …); conversation/thread ids get `"thread_sid"` (`t1`, …).
+- Kind letters: `m` message, `d` draft, `e` event/appointment, `k` task, `c` contact, `a` attachment, `t` conversation/thread, `f` folder.
+- **Every id parameter accepts either an alias or a raw id.** Anything not alias-shaped (`^[a-z]{1,2}[0-9]+$`) passes through unchanged, so raw ids keep working everywhere.
+- **Aliases survive moves.** When a move response reports `{old_id, new_id}` the alias is rebound to the new raw id — the handle you hold keeps working after `move_email` / `move_messages`.
+- A stale or unknown alias returns a clean validation error ("re-run the search/list tool to get fresh ids"), not a 500.
+- State persists in `<EWS_MEMORY_DIR>/aliases.db` (SQLite, WAL), so aliases survive restarts.
+
+Aliasing is strictly additive: any aliasing failure degrades to raw-id passthrough and never takes a tool call down.
+
+## Meta Tools
+
+### whoami
+
+Identity, backend, capabilities, and health self-report — the recommended first call. Read-only; works even while the background Exchange warmup is still connecting.
+
+**Input Schema:**
+```json
+{
+  "target_mailbox": "other@example.com",  // Optional: probe a delegated/impersonated mailbox
+  "probe_connection": true                // Default true; false = pure-config answer, no network call
+}
+```
+
+**Response (abridged):**
+```json
+{
+  "success": true,
+  "message": "EWS-MCP 3.5.0 — you@example.com",
+  "mailbox": "you@example.com",
+  "primary_mailbox": "you@example.com",
+  "backend": "ews",
+  "server": "https://mail.example.com/EWS/Exchange.asmx",
+  "autodiscover": false,
+  "auth_type": "ntlm",
+  "impersonation": { "enabled": false, "type": "impersonation" },
+  "transport": "sse",
+  "send_enabled": true,
+  "timezone": "Asia/Riyadh",
+  "server_name": "ews-mcp-server",
+  "version": "3.5.0",
+  "tool_count": 78,
+  "connection": {
+    "probed": true,
+    "managed": {
+      "state": "warm",              // connecting | warm | degraded
+      "attempts": 1,
+      "last_error": null,
+      "last_success_age_s": 12,
+      "next_retry_in_s": null
+    },
+    "ok": true,
+    "server_version": "Exchange2016",
+    "api_version": "Exchange2016"
+  },
+  "ews_sunset": { "applies": false, "backend": "on_premises", "note": "..." }
+}
+```
+
+`connection.managed` is the background warmup/heartbeat state (same snapshot as `/readyz`); `ews_sunset` surfaces the Exchange Online EWS retirement advisory when the backend is Exchange Online.
+
 ## Contact Intelligence Tools (v3.3 Consolidated)
 
 These tools leverage the person-centric architecture with multi-strategy GAL search.
@@ -171,7 +347,7 @@ Unified contact analysis tool with multiple analysis types.
 
 ### send_email
 
-Send an email through Exchange with optional attachments and CC/BCC.
+Send an email through Exchange with optional attachments and CC/BCC. **Two-phase confirmed** (see [Two-phase confirmation](#two-phase-confirmation)) and subject to `SEND_ENABLED`, the capability tier, recipient allow/denylists, and `EWS_MAX_SENDS_PER_HOUR`.
 
 **Input Schema:**
 ```json
@@ -182,11 +358,15 @@ Send an email through Exchange with optional attachments and CC/BCC.
   "cc": ["cc@example.com"],           // Optional
   "bcc": ["bcc@example.com"],         // Optional
   "importance": "Normal",             // Optional: Low, Normal, High
-  "attachments": ["/path/to/file"]    // Optional
+  "attachments": ["/path/to/file"],   // Optional
+  "dry_run": false,                   // Optional: validate + preview, never send
+  "confirm_token": "eyJ..."           // Phase-2 token; omit on the first call
 }
 ```
 
-**Response:**
+The first call (no `confirm_token`) returns `{requires_confirmation: true, preview, confirm_token, expires_at, ttl_seconds}` and sends nothing; repeating it with the token and identical arguments sends.
+
+**Response (phase 2):**
 ```json
 {
   "success": true,
@@ -197,16 +377,52 @@ Send an email through Exchange with optional attachments and CC/BCC.
 }
 ```
 
-### read_emails
+### reply_email
 
-Read emails from a specified folder.
+Reply to an email, preserving the conversation thread (quoted headers, inline images, signature placement). **Two-phase confirmed** and send-gated like `send_email`.
 
 **Input Schema:**
 ```json
 {
-  "folder": "inbox",          // inbox, sent, drafts, deleted, junk
+  "message_id": "AAMkAGI...",        // Required: message to reply to (raw id or sid)
+  "body": "<p>Reply text</p>",       // Required (HTML supported)
+  "reply_all": false,                // true = reply to sender + all recipients
+  "attachments": ["/path/to/file"],  // Optional
+  "target_mailbox": "shared@example.com",
+  "confirm_token": "eyJ..."          // Phase-2 token; omit on the first call
+}
+```
+
+### forward_email
+
+Forward an email to new recipients with the original content and attachments preserved. **Two-phase confirmed** and send-gated like `send_email`.
+
+**Input Schema:**
+```json
+{
+  "message_id": "AAMkAGI...",        // Required (raw id or sid)
+  "to": ["recipient@example.com"],   // Required
+  "body": "<p>FYI</p>",              // Optional note above the forwarded content
+  "cc": ["cc@example.com"],          // Optional
+  "bcc": ["bcc@example.com"],        // Optional
+  "attachments": ["/path/to/file"],  // Optional additional attachments
+  "target_mailbox": "shared@example.com",
+  "confirm_token": "eyJ..."          // Phase-2 token; omit on the first call
+}
+```
+
+### read_emails
+
+Read emails from a specified folder, paginated.
+
+**Input Schema:**
+```json
+{
+  "folder": "inbox",          // Standard names (inbox, sent, drafts...), paths (Inbox/CC), or a folder ID
   "max_results": 50,          // Max: 1000
-  "unread_only": false
+  "unread_only": false,
+  "offset": 0,                // Pagination offset; pair with the response's next_offset
+  "fields": ["subject", "from", "received_time"]   // Optional projection (default: light list fields, no body)
 }
 ```
 
@@ -215,21 +431,28 @@ Read emails from a specified folder.
 {
   "success": true,
   "message": "Retrieved 10 emails",
-  "emails": [
+  "items": [
     {
       "message_id": "AAMkAGI...",
+      "sid": "m7",
       "subject": "Meeting Tomorrow",
       "from": "sender@example.com",
       "received_time": "2025-01-04T09:30:00",
       "is_read": false,
       "has_attachments": true,
-      "preview": "Please review the attached..."
+      "snippet": "Please review the attached..."
     }
   ],
-  "total_count": 10,
+  "count": 10,
+  "total_available": 245,
+  "next_offset": 10,          // Present only when more items remain
+  "emails": [ ... ],          // Legacy mirror of items (one-release deprecation window)
+  "total_count": 10,          // Legacy mirror of count
   "folder": "inbox"
 }
 ```
+
+Failures are **classified, not silent**: a mid-page failure with nothing collected raises a tool error tagged `TIMEOUT`, `THROTTLED`, `CONNECTION`, `AUTH_EXPIRED`, or `UNKNOWN` — an empty folder still returns `success: true` with zero items, so "broken" and "empty" are distinguishable. A partial page carries `meta: {error_code, error_message}`. List snippets show the **latest reply only** (quoted history is not re-shipped).
 
 ### search_emails
 
@@ -286,17 +509,20 @@ Get full details of a specific email.
 **Input Schema:**
 ```json
 {
-  "message_id": "AAMkAGI..."
+  "message_id": "AAMkAGI...",                 // Required (raw id or sid)
+  "fields": ["subject", "from", "body"],      // Optional projection of the email object
+  "format": "full"                            // full (default) | clean
 }
 ```
 
-**Response:**
+**Response (format: "full"):**
 ```json
 {
   "success": true,
   "message": "Email details retrieved",
   "email": {
     "message_id": "AAMkAGI...",
+    "sid": "m7",
     "subject": "Project Update",
     "from": "sender@example.com",
     "to": ["you@example.com"],
@@ -308,7 +534,23 @@ Get full details of a specific email.
     "is_read": true,
     "has_attachments": true,
     "importance": "High",
-    "attachments": ["report.pdf", "data.xlsx"]
+    "attachments": ["report.pdf", "data.xlsx"],
+    "internet_message_id": "<CAF1x...@mail.example.com>"
+  }
+}
+```
+
+`internet_message_id` (the RFC-5322 Message-ID) is always included — unlike EWS ItemIds it survives folder moves.
+
+**`format: "clean"`** is the token-lean reading view: quoted reply history and signature stripped, `body_html` dropped, body truncated at a word boundary (~4000 chars). When quoting was stripped, the email object notes it:
+
+```json
+{
+  "email": {
+    "body": "Latest reply text only",
+    "quoted_history": "stripped 3 quoted block(s) — use get_thread for the full conversation",
+    "body_truncated": true,
+    "internet_message_id": "<CAF1x...@mail.example.com>"
   }
 }
 ```
@@ -320,10 +562,14 @@ Delete an email (soft delete to trash or permanent delete).
 **Input Schema:**
 ```json
 {
-  "message_id": "AAMkAGI...",
-  "permanent": false    // true for hard delete
+  "message_id": "AAMkAGI...",   // Raw id or sid
+  "permanent": false,           // true = HARD delete (two-phase). Alias: hard_delete
+  "hard_delete": false,         // Alias for permanent
+  "confirm_token": "eyJ..."     // Phase-2 token for permanent delete
 }
 ```
+
+Soft delete (default) moves the message to Deleted Items, is reversible, and executes immediately. `permanent: true` is gated by [two-phase confirmation](#two-phase-confirmation): the first call returns a preview + `confirm_token` and deletes nothing; repeating with the token deletes.
 
 ### move_email
 
@@ -366,6 +612,101 @@ Update email properties such as read status, flags, categories, and importance.
   }
 }
 ```
+
+## Batch Email Tools
+
+Plural counterparts of `update_email` / `move_email` / `delete_email` — act on up to **50 message ids** in one call. Each returns **per-item** results so a partial failure never sinks the batch, plus summary counts (`count`, `ok_count`, `error_count`). All accept raw ids or sids in `message_ids`.
+
+### update_messages
+
+Bulk mark read/unread, (re)categorize, flag, or set importance. Requires at least one of `is_read`, `categories`, `flag_status`, `importance`.
+
+**Input Schema:**
+```json
+{
+  "message_ids": ["AAMkAGF1...", "m12"],   // Required, max 50
+  "is_read": true,
+  "categories": ["Work"],
+  "flag_status": "Flagged",                // NotFlagged, Flagged, Complete
+  "importance": "High",                    // Low, Normal, High
+  "target_mailbox": "shared@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Bulk update complete",
+  "results": [
+    { "message_id": "AAMkAGF1...", "ok": true, "updates": { "is_read": true } },
+    { "message_id": "m12", "ok": false, "error": "ErrorItemNotFound: ..." }
+  ],
+  "count": 2,
+  "ok_count": 1,
+  "error_count": 1
+}
+```
+
+### move_messages
+
+Bulk move messages to a folder (by name/path or id). EWS ItemIds change on move — per-item results include the **new id** (`new_id`); sid aliases are rebound automatically so the handles you hold keep working.
+
+**Input Schema:**
+```json
+{
+  "message_ids": ["AAMkAGF1..."],          // Required, max 50
+  "destination_folder": "Archive/2026",    // Folder name or path...
+  "destination_folder_id": "AAMkAGF...",   // ...or folder id (alternative)
+  "target_mailbox": "shared@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Bulk move to Archive/2026 complete",
+  "results": [
+    { "message_id": "AAMkAGF1...", "ok": true, "new_id": "AAMkNEW..." }
+  ],
+  "destination_folder": "Archive/2026",
+  "count": 1,
+  "ok_count": 1,
+  "error_count": 0
+}
+```
+
+### delete_messages
+
+Bulk delete. Soft delete (default) moves to Deleted Items and is reversible. `permanent: true` (alias `hard_delete`) is a HARD delete gated by [two-phase confirmation](#two-phase-confirmation): the first call (no `confirm_token`) returns a preview + token bound to the exact id set; the second call with the token deletes.
+
+**Input Schema:**
+```json
+{
+  "message_ids": ["AAMkAGF1..."],   // Required, max 50
+  "permanent": false,               // Hard delete (two-phase). Alias: hard_delete
+  "confirm_token": "eyJ...",        // Phase-2 token for hard delete
+  "target_mailbox": "shared@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Bulk delete complete",
+  "results": [
+    { "message_id": "AAMkAGF1...", "ok": true, "action": "moved_to_trash" }
+  ],
+  "permanent": false,
+  "count": 1,
+  "ok_count": 1,
+  "error_count": 0
+}
+```
+
+(`action` is `"permanently_deleted"` for hard deletes.)
 
 ### list_attachments
 
@@ -516,6 +857,48 @@ Retrieve calendar events for a date range.
 }
 ```
 
+### get_event
+
+Get full detail for a single calendar event by id: attendees with response status, organizer, body, recurrence flags, and iCal uid. Complements `get_calendar` (which lists a range).
+
+**Input Schema:**
+```json
+{
+  "item_id": "AAMkAGV...",     // Calendar item id from get_calendar (raw id or sid)
+  "event_id": "AAMkAGV...",    // Alias for item_id
+  "max_body_chars": 4000,      // 0 omits the body
+  "target_mailbox": "shared@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Event retrieved",
+  "event": {
+    "item_id": "AAMkAGV...",
+    "sid": "e3",
+    "ical_uid": "040000008200E0...",
+    "subject": "Team Meeting",
+    "start": "2026-06-15T10:00:00+03:00",
+    "end": "2026-06-15T11:00:00+03:00",
+    "location": "Room A",
+    "is_all_day": false,
+    "is_recurring": false,
+    "is_meeting": true,
+    "organizer": "manager@example.com",
+    "my_response": "Accept",
+    "required_attendees": [
+      { "email": "you@example.com", "name": "You", "response": "Accept" }
+    ],
+    "optional_attendees": [],
+    "body": "Agenda...",
+    "body_truncated": false
+  }
+}
+```
+
 ### update_appointment
 
 Update an existing appointment.
@@ -546,14 +929,15 @@ Delete a calendar appointment.
 
 ### respond_to_meeting
 
-Respond to a meeting invitation.
+Respond to a meeting invitation. Accept/decline transmits a response message to the organizer immediately, so this is send-class and **two-phase confirmed** (see [Two-phase confirmation](#two-phase-confirmation)): the first call previews; repeat with `confirm_token` to send the response.
 
 **Input Schema:**
 ```json
 {
-  "item_id": "AAMkAGV...",
+  "item_id": "AAMkAGV...",     // Raw id or sid
   "response": "Accept",        // Accept, Tentative, Decline
-  "message": "I'll be there"   // Optional response message
+  "message": "I'll be there",  // Optional response message
+  "confirm_token": "eyJ..."    // Phase-2 token; omit on the first call
 }
 ```
 
@@ -814,6 +1198,8 @@ Unified folder management with 4 actions: create, delete, rename, move.
 
 **v3.3 Changes:** Replaces `create_folder`, `delete_folder`, `rename_folder`, `move_folder`.
 
+**v3.5 Changes:** `action: "delete"` (the one irreversible action — it deletes the folder *and its contents*) is gated by [two-phase confirmation](#two-phase-confirmation): the first call returns a preview + `confirm_token`; repeat with the token to delete. Other actions execute immediately.
+
 **Input Schema (action: "create"):**
 ```json
 {
@@ -946,6 +1332,84 @@ Build a forward draft (full body + inline images + attachments preserved).
 ```
 
 **Response:** `{ "success": true, "draft_id": "AAMkAGF..." }`
+
+### update_draft
+
+Edit an existing draft's subject / to / cc / bcc / body / importance by id. Reversible; does not send. Each provided field replaces the draft's; omitted fields are left unchanged.
+
+**Input Schema:**
+```json
+{
+  "draft_id": "AAMkAGF...",            // Required: message_id of the draft (raw id or sid)
+  "subject": "New subject",
+  "to": ["a@example.com"],
+  "cc": ["cc@example.com"],
+  "bcc": ["bcc@example.com"],
+  "body": "<p>Replacement body</p>",   // HTML auto-detected
+  "importance": "High",                // Low / Normal / High
+  "target_mailbox": "shared@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Draft updated.",
+  "draft_id": "AAMkAGF...",
+  "updated": { "subject": "New subject", "body_chars": 120 }
+}
+```
+
+### send_draft
+
+Send an existing draft (from `create_draft` / `create_reply_draft` / `create_forward_draft`) by its id. **Two-phase with a content-bound token**: phase 1 (no `confirm_token`) returns a preview + short-lived token and sends nothing; phase 2 (with the token) sends. The token is bound to the draft's current subject/recipients/body, so editing the draft (e.g. via `update_draft`) invalidates it and forces a fresh preview. Blocked entirely when `SEND_ENABLED=false`.
+
+**Input Schema:**
+```json
+{
+  "draft_id": "AAMkAGF...",       // Required (raw id or sid)
+  "confirm_token": "eyJ...",      // Omit on the first call
+  "idempotency_key": "uuid-...",  // Optional: client UUID for safe retries
+  "target_mailbox": "shared@example.com"
+}
+```
+
+**Response (phase 1):**
+```json
+{
+  "success": true,
+  "requires_confirmation": true,
+  "confirm_token": "eyJ...{signature}",
+  "expires_at": 1781000000,
+  "ttl_seconds": 600,
+  "preview": {
+    "draft_id": "AAMkAGF...",
+    "to": ["a@example.com"],
+    "cc": [],
+    "bcc": [],
+    "subject": "Quarterly report",
+    "body_preview": "First 1000 chars...",
+    "attachment_count": 1
+  }
+}
+```
+
+**Response (phase 2):**
+```json
+{
+  "success": true,
+  "message": "Draft sent.",
+  "sent": true,
+  "draft_id": "AAMkAGF...",
+  "message_id": "<CAF1x...@mail.example.com>",
+  "to": ["a@example.com"],
+  "cc": [],
+  "subject": "Quarterly report"
+}
+```
+
+With `idempotency_key`, a retry carrying the same key against an unchanged draft returns the cached receipt with `"idempotent_replay": true` instead of sending again.
 
 ## Enhanced Attachment Tools
 
@@ -1095,6 +1559,43 @@ Find all emails in a conversation thread.
 }
 ```
 
+### get_thread
+
+Reconstruct a whole conversation into one thread object: participants, date range, and the messages **oldest→newest**. Pass `message_id` OR `conversation_id` (raw ids or sids). The single highest-value read for a secretary-style agent.
+
+**Input Schema:**
+```json
+{
+  "message_id": "AAMkAGF...",       // Any message in the thread...
+  "conversation_id": "AAQkAGF...",  // ...or the conversation id (alternative)
+  "max_messages": 50,               // 1-200
+  "bodies": "latest",               // none | latest (default: full text only for the newest message) | all
+  "clean_bodies": true,             // Default true: strip quoted history + signature from each body
+  "target_mailbox": "shared@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Thread with 5 message(s)",
+  "thread_id": "AAQkAGF...",
+  "thread_sid": "t1",
+  "subject": "RE: Project Discussion",
+  "message_count": 5,
+  "participants": ["alice@example.com", "bob@example.com"],
+  "date_range": ["2026-01-10T09:00:00+00:00", "2026-01-12T16:45:00+00:00"],
+  "messages": [
+    { "message_id": "AAMkAGF1...", "sid": "m3", "subject": "Project Discussion", "from": "alice@example.com", "received_time": "2026-01-10T09:00:00+00:00", "snippet": "..." }
+  ],
+  "latest": { "message_id": "AAMkAGF5...", "sid": "m9", "body": "Latest reply text", "quoted_stripped": 4 },
+  "truncated": false
+}
+```
+
+With `clean_bodies: true` (default) each returned body has its quoted reply history and signature stripped — the older messages are already in the thread, so re-shipping the quoted chain is pure redundancy. Stripped messages carry `quoted_stripped` (count of removed blocks) and `body_truncated` when capped. Pass `clean_bodies: false` for raw text bodies.
+
 > **Note:** `full_text_search` has been merged into `search_emails(mode="full_text")`. See Email Tools above.
 
 ## Out-of-Office Tools
@@ -1104,6 +1605,8 @@ Find all emails in a conversation thread.
 Unified Out-of-Office tool with get and set actions.
 
 **v3.3 Changes:** Replaces `set_oof_settings` and `get_oof_settings`.
+
+**v3.5 Changes:** `action: "set"` changes externally visible auto-reply behavior for every correspondent, so it is gated by [two-phase confirmation](#two-phase-confirmation): the first call returns a preview + `confirm_token`; repeat with the token to apply. `action: "get"` is ungated.
 
 **Input Schema (action: "set"):**
 ```json

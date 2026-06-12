@@ -6,7 +6,7 @@
 
 *Give AI assistants first-class access to mail, calendar, contacts, tasks, and directory services*
 
-[![Version](https://img.shields.io/badge/version-3.4.x-blue.svg)](https://github.com/azizmazrou/ews-mcp)
+[![Version](https://img.shields.io/badge/version-3.5.x-blue.svg)](https://github.com/azizmazrou/ews-mcp)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io/azizmazrou/ews-mcp)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io)
@@ -624,7 +624,7 @@ All settings are parsed by `src/config.py` (Pydantic `Settings`). Examples live 
 | `API_BASE_URL` | — | Public URL advertised in the OpenAPI `servers` array |
 | `API_BASE_URL_INTERNAL` | — | Internal container URL (e.g. `http://ews-mcp:8000`) |
 | `API_TITLE` | `Exchange Web Services (EWS) MCP API` | OpenAPI title |
-| `API_VERSION` | `3.4.0` | OpenAPI version |
+| `API_VERSION` | `3.5.0` | OpenAPI version |
 
 #### Category feature flags
 

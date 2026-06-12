@@ -1,5 +1,125 @@
 # Changelog
 
+## [v3.5.0] - 2026-06-12
+
+Reliability, safety, and agent-ergonomics release. **No breaking changes** —
+every new env var defaults to the historical behavior. Full reference for the
+new surfaces lives in `docs/API.md` (Endpoints, Two-phase confirmation,
+Short ids).
+
+### Reliability
+
+- **Never-exit startup.** Startup no longer gates on a successful Exchange
+  connection: tools register and transports bind immediately while a
+  background warmup loop (`src/connection_manager.py`) retries with
+  exponential backoff + full jitter (cap `EWS_WARMUP_MAX_BACKOFF_SECONDS`,
+  default 300), escalating to a full cached-session reset every 3 failures.
+  A periodic heartbeat (`EWS_HEARTBEAT_SECONDS`, default 600; 0 disables)
+  re-probes a warm connection and re-arms the warmup on failure
+  (states: `connecting` → `warm` → `degraded`).
+- **New public endpoints** `GET /livez` (200 = process/event loop up) and
+  `GET /readyz` (200 when the connection is warm; 503 otherwise with
+  `{status, connection: {state, attempts, last_error, last_success_age_s,
+  next_retry_in_s}, tools}` so a stuck deploy is diagnosable from curl
+  alone). Both are public like `/health`.
+- **exchangelib `FaultTolerance` enabled** — transient `ErrorServerBusy`
+  back-offs and 503s are retried inside a single request up to
+  `EWS_RETRY_MAX_WAIT_SECONDS` (default 300) before raising.
+- **EWS tool bodies run on a bounded worker pool**
+  (`EWS_OFFLOAD_ENABLED`, default true; `EWS_MAX_CONCURRENCY`, default 4)
+  instead of inline on the event loop, so one slow Exchange round-trip can
+  no longer freeze every concurrent request, SSE keepalive, and `/health`.
+  The pool size doubles as the EWS concurrency cap (stay polite under the
+  per-user `EWSMaxConcurrency` budget shared with Outlook/OWA).
+- **`whoami` now reports `connection.managed`** — the warmup/heartbeat
+  state snapshot (same shape as `/readyz`) — and keeps working while the
+  connection is still warming (`probe_connection=false` for a pure-config
+  answer). While never-connected, EWS-touching tools fail fast with a
+  retry hint instead of hanging.
+
+### Safety
+
+- **Central two-phase confirm** for irreversible / externally visible
+  operations: `send_email`, `reply_email`, `forward_email`,
+  `respond_to_meeting` (and `delete_appointment`) always;
+  `delete_email` / `delete_messages` (only `permanent`/`hard_delete`),
+  `manage_folder` (only `action=delete`), `oof_settings` (only
+  `action=set`) conditionally. Phase 1 without `confirm_token` returns
+  `{requires_confirmation: true, confirm_token, expires_at, ttl_seconds,
+  preview, warnings?}` and executes **nothing**; phase 2 with the token +
+  identical arguments executes. Tokens are stateless HMACs bound to
+  (mailbox, tool, exact args) — they die on any argument change or after
+  the TTL (600 s; set `SEND_CONFIRM_SECRET` to keep tokens valid across
+  restarts). `confirm_token` auto-appears in the published schema of every
+  gated tool. `send_draft` keeps its own richer two-phase flow with a
+  content-bound token (editing the draft invalidates it). The
+  approval-queue executor pre-confirms via the same HMAC machinery — a
+  human approval mints a valid phase-2 token instead of a bypass flag.
+- **Capability tiers.** `EWS_CAPABILITY_TIER=read|draft|full` (default
+  `full`): `read` = read-only tools, `draft` adds reversible writes,
+  `full` adds send + destructive classes. Above-tier tools are removed
+  from the registry at startup AND refused at dispatch (defense in depth).
+- **Recipient guards.** `EWS_RECIPIENT_ALLOWLIST` /
+  `EWS_RECIPIENT_DENYLIST` (comma-separated fnmatch globs, e.g.
+  `*@example.com`) gate every send-class tool on argument-visible
+  recipients; the denylist wins.
+- **Send rate cap.** `EWS_MAX_SENDS_PER_HOUR` across all send-class
+  executions (0 = unlimited, the default).
+- **Hash-chained audit log.** Every audit record carries
+  `seq`/`prev`/`h` with `h = sha256(prev_hash | core)`, so an edited or
+  deleted record breaks every hash after it;
+  `scripts/verify_audit_chain.py` verifies the chain.
+- **MCP tool annotations.** `list_tools` now publishes
+  `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`
+  per tool, derived from its `side_effect_class` (hints only — the
+  server-side gates above remain the real boundary).
+
+### Agent ergonomics
+
+- **Short id aliases (sid).** Every long EWS id in tool outputs gains a
+  sibling `"sid"` (`m12`, `e3`, `t1`, …; conversation ids get
+  `thread_sid`). All id params accept aliases or raw ids; aliases survive
+  moves (rebound on `{old_id, new_id}` remaps); a stale alias yields a
+  clean validation error with a re-search hint instead of a 500.
+  `EWS_ID_ALIASES_ENABLED` (default true); state persists in
+  `<EWS_MEMORY_DIR>/aliases.db`. (`src/id_alias.py`, `src/tools/base.py`)
+- **Token-lean reading.** Search/list snippets show the latest reply
+  only; `get_email_details` gains `format="clean"` (strips quoted history
+  + signature, drops `body_html`, adds a `quoted_history` note and the
+  move-stable `internet_message_id` field); `get_thread` gains
+  `clean_bodies` (default true). (`src/body_clean.py`)
+- **`read_emails` pagination params.** New `offset` and `fields`
+  (projection) params; the canonical paged envelope
+  `{items, count, total_available, next_offset}` is emitted alongside the
+  legacy `emails`/`total_count` keys (one-release deprecation window).
+- **Streamable HTTP transport.** New stateless `/mcp` endpoint
+  (MCP spec 2025-03-26+) alongside the legacy `/sse` + `/messages`
+  transport; SDK pinned `mcp>=1.27,<2`.
+- **API docs caught up** (`docs/API.md`): new entries for `whoami`,
+  `send_draft`, `update_draft`, `get_thread`, `get_event`,
+  `update_messages`, `move_messages`, `delete_messages`, plus the
+  Endpoints / Two-phase confirmation / Short ids sections.
+
+### Fixed
+
+- **`read_emails` returning zero items on a broken connection.** The old
+  direct iteration swallowed mid-iteration errors (throttling, auth
+  expiry, transient resets), making "broken" indistinguishable from
+  "empty" — the production zero-items symptom. `read_emails` now uses the
+  same classified-pagination path as `search_emails`: a failure with
+  nothing collected surfaces as a classified error
+  (`TIMEOUT` / `THROTTLED` / `CONNECTION` / `AUTH_EXPIRED` / `UNKNOWN`),
+  and a partial page carries `meta.error_code` — an empty folder still
+  returns `success: true` with zero items.
+
+### Compatibility
+
+No breaking changes; new env vars default to historical behavior
+(`EWS_CAPABILITY_TIER=full`, `EWS_MAX_SENDS_PER_HOUR=0`, empty recipient
+lists, `EWS_ID_ALIASES_ENABLED=true` and `EWS_OFFLOAD_ENABLED=true` are
+additive/behavior-neutral). Legacy `read_emails` response keys and the
+`/sse` transport keep working.
+
 ## Unreleased — Test-suite hardening + 3 production bugs
 
 A focused pass to break the "fix one bug, the next refactor regresses
