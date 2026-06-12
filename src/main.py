@@ -13,7 +13,8 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tup
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.types import Tool, TextContent, ToolAnnotations
 from starlette.applications import Starlette
 from starlette.routing import Route
 
@@ -412,6 +413,29 @@ def _authorized_request(
     return False
 
 
+# Side-effect class → MCP tool annotations. Untrusted hints by spec —
+# clients may use them to relax/strengthen confirmation prompts, but
+# server-side gates (kill-switch, confirm tokens) remain the real boundary.
+TOOL_ANNOTATIONS: Dict[str, ToolAnnotations] = {
+    "read": ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
+    ),
+    "write": ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=False,
+    ),
+    "destructive": ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True,
+        idempotentHint=False, openWorldHint=False,
+    ),
+    "send": ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True,
+        idempotentHint=False, openWorldHint=True,
+    ),
+}
+
+
 class EWSMCPServer:
     """MCP Server for Exchange Web Services with comprehensive logging."""
 
@@ -496,7 +520,11 @@ class EWSMCPServer:
                 Tool(
                     name=tool.get_schema()["name"],
                     description=tool.get_schema()["description"],
-                    inputSchema=tool.get_schema()["inputSchema"]
+                    inputSchema=tool.get_schema()["inputSchema"],
+                    annotations=TOOL_ANNOTATIONS.get(
+                        getattr(tool, "side_effect_class", "write"),
+                        TOOL_ANNOTATIONS["write"],
+                    ),
                 )
                 for tool in self.tools.values()
             ]
@@ -1110,10 +1138,22 @@ class EWSMCPServer:
             self.logger.warning(f"warmup: failed: {exc}")
 
     async def run_sse(self):
-        """Run the MCP server with SSE (HTTP) transport."""
+        """Run the MCP server over HTTP: legacy SSE + Streamable HTTP.
+
+        ``/sse`` + ``/messages`` keep serving the deprecated HTTP+SSE
+        transport for existing clients; ``/mcp`` adds the modern
+        Streamable HTTP transport (spec 2025-03-26+) for new ones.
+        Both ride the same low-level ``Server`` and tool registry.
+        """
         import uvicorn
 
         sse = SseServerTransport("/messages")
+        # Stateless mode: every POST /mcp is self-contained — no session
+        # bookkeeping or resumability, which is all our short-lived tool
+        # calls need. The orchestrator's REST shim stays untouched.
+        streamable = StreamableHTTPSessionManager(
+            app=self.server, json_response=False, stateless=True,
+        )
         keepalive_enabled = bool(
             getattr(self.settings, "sse_keepalive_enabled", True)
         )
@@ -1314,6 +1354,10 @@ class EWSMCPServer:
                 elif path == "/messages" and method == "POST":
                     await handle_messages(scope, receive, send)
 
+                # Modern MCP Streamable HTTP transport (POST/GET/DELETE)
+                elif path == "/mcp":
+                    await streamable.handle_request(scope, receive, send)
+
                 # OpenAPI/REST endpoints
                 elif path == "/openapi.json" and method == "GET":
                     # Return OpenAPI schema
@@ -1442,7 +1486,10 @@ class EWSMCPServer:
                 self.logger.debug("TCP keepalive setup skipped: %s", exc)
             await serve_task
 
-        await _serve_with_tcp_keepalive()
+        # The session manager's task group must be running for the whole
+        # serve window — handle_request refuses outside run().
+        async with streamable.run():
+            await _serve_with_tcp_keepalive()
 
 
 def main():
