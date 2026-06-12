@@ -1,6 +1,6 @@
 """Exchange Web Services client wrapper."""
 
-from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION, NTLM, EWSTimeZone
+from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION, NTLM, BASIC, EWSTimeZone
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 import logging
@@ -300,14 +300,19 @@ class EWSClient:
     def _explicit_auth_type(self):
         """Return the exchangelib auth_type to pin on Configuration, or None.
 
-        NTLM must be pinned explicitly: a plain ``Credentials`` without
-        ``auth_type=NTLM`` makes exchangelib negotiate and effectively use
-        Basic, so ``EWS_AUTH_TYPE=ntlm`` silently behaved like Basic before.
-        OAuth2 is inferred from ``OAuth2Credentials`` and Basic is the
-        negotiated default, so only NTLM needs an explicit pin here.
+        Pinning the configured scheme skips exchangelib's auth-type
+        auto-detection probe (a ``GET`` to the endpoint). That probe is
+        fragile against corporate Exchange that answers 401 with multiple
+        ``WWW-Authenticate`` schemes (Negotiate/NTLM/Basic): it raises
+        "Failed to get auth type from service", so a freshly-started
+        container fails its startup connection test. Both BASIC and NTLM are
+        pinned explicitly; OAuth2 is inferred from ``OAuth2Credentials`` and
+        needs no pin.
         """
         if self.config.ews_auth_type == "ntlm":
             return NTLM
+        if self.config.ews_auth_type == "basic":
+            return BASIC
         return None
 
     def clear_impersonation_cache(self) -> None:

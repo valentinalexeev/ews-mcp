@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict
 
-from exchangelib import NTLM
+from exchangelib import NTLM, BASIC
 
 from src.config import Settings
 from src.auth import AuthHandler
@@ -125,11 +125,11 @@ def test_whoami_flags_exchange_online_sunset():
 # --- NTLM auth_type pin -----------------------------------------------------
 
 
-def test_explicit_auth_type_pins_ntlm_only():
+def test_explicit_auth_type_pins_basic_and_ntlm():
+    # Both on-prem schemes are pinned to skip the fragile auth-type
+    # auto-detection probe; OAuth2 is inferred from OAuth2Credentials.
     cfg_ntlm = _settings(ews_auth_type="ntlm")
-    client_ntlm = EWSClient(cfg_ntlm, AuthHandler(cfg_ntlm))
-    assert client_ntlm._explicit_auth_type() is NTLM
+    assert EWSClient(cfg_ntlm, AuthHandler(cfg_ntlm))._explicit_auth_type() is NTLM
 
     cfg_basic = _settings(ews_auth_type="basic")
-    client_basic = EWSClient(cfg_basic, AuthHandler(cfg_basic))
-    assert client_basic._explicit_auth_type() is None
+    assert EWSClient(cfg_basic, AuthHandler(cfg_basic))._explicit_auth_type() is BASIC
