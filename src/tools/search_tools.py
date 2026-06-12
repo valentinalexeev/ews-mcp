@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Set
 from datetime import datetime
 
 from .base import BaseTool
+from ..body_clean import clean_body
 from ..exceptions import ToolExecutionError, ValidationError
 from ..utils import (
     format_success_response, safe_get, truncate_text,
@@ -356,6 +357,15 @@ class GetThreadTool(BaseTool):
                     "conversation_id": {"type": "string", "description": "Conversation id (alternative to message_id)"},
                     "max_messages": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
                     "bodies": {"type": "string", "enum": ["none", "latest", "all"], "default": "latest"},
+                    "clean_bodies": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "Strip each message's quoted reply history and "
+                            "signature (the thread already shows the older "
+                            "messages). false returns raw text bodies."
+                        ),
+                    },
                     "target_mailbox": {"type": "string"},
                 },
                 "required": [],
@@ -398,6 +408,24 @@ class GetThreadTool(BaseTool):
         if bodies == "latest":
             for m in messages[:-1]:
                 m.pop("body", None)
+
+        # Each message's text_body quotes the whole chain below it — in a
+        # thread DTO that's pure redundancy (the older messages are right
+        # there). Strip per-message quoted history unless asked not to.
+        if bool(kwargs.get("clean_bodies", True)):
+            for m in messages:
+                raw = m.get("body")
+                if not isinstance(raw, str) or not raw:
+                    continue
+                try:
+                    cleaned = clean_body(raw, max_chars=3000)
+                except Exception:
+                    continue
+                m["body"] = cleaned["text"]
+                if cleaned["quoted_blocks_stripped"]:
+                    m["quoted_stripped"] = cleaned["quoted_blocks_stripped"]
+                if cleaned["truncated"]:
+                    m["body_truncated"] = True
 
         participants: List[str] = []
         seen: Set[str] = set()

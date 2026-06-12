@@ -28,6 +28,7 @@ FLAG_STATUS_MAP = {
 import re
 
 from .base import BaseTool
+from ..body_clean import clean_body, html_to_text, strip_quoted_history
 from ..models import SendEmailRequest, EmailSearchRequest, EmailDetails
 from ..exceptions import ToolExecutionError, ValidationError
 from ..utils import (
@@ -269,6 +270,14 @@ def _build_list_item(
     text_body = safe_get(email, "text_body", "") or ""
     received = safe_get(email, "datetime_received", None)
     received_iso = received.isoformat() if received and hasattr(received, "isoformat") else None
+    # Snippet shows the latest reply, not the quoted chain below it — a
+    # two-line answer quoting a long thread used to fill all 200 chars
+    # with "From: ... Sent: ..." noise.
+    snippet_source = text_body
+    try:
+        snippet_source = strip_quoted_history(text_body)[0] or text_body
+    except Exception:
+        pass
     item = {
         "message_id": ews_id_to_str(safe_get(email, "id", None)) or "",
         "subject": safe_get(email, "subject", "") or "",
@@ -282,7 +291,7 @@ def _build_list_item(
         "has_attachments": safe_get(email, "has_attachments", False),
         "importance": safe_get(email, "importance", "Normal"),
         "categories": safe_get(email, "categories", []) or [],
-        "snippet": truncate_text(text_body, 200),
+        "snippet": truncate_text(snippet_source, 200),
         "folder": folder_name,
     }
     if "body" in fields:
@@ -1961,6 +1970,19 @@ class GetEmailDetailsTool(BaseTool):
                             "compatibility."
                         ),
                     },
+                    "format": {
+                        "type": "string",
+                        "enum": ["full", "clean"],
+                        "default": "full",
+                        "description": (
+                            "'full' (default) returns body + raw body_html "
+                            "unchanged. 'clean' returns a token-lean reading "
+                            "view: quoted reply history and signature "
+                            "stripped, no body_html, truncated at a word "
+                            "boundary — the right choice for an agent that "
+                            "wants to *read* the message."
+                        ),
+                    },
                 },
                 "required": ["message_id"]
             }
@@ -2021,7 +2043,26 @@ class GetEmailDetailsTool(BaseTool):
                 "has_attachments": safe_get(item, "has_attachments", False),
                 "importance": safe_get(item, "importance", "Normal") or "Normal",
                 "attachments": attachment_names,
+                # RFC-5322 Message-ID: survives folder moves (EWS ItemIds
+                # don't) — the aliaser stores it for stale-id recovery.
+                "internet_message_id": safe_get(item, "message_id", None),
             }
+
+            if kwargs.get("format") == "clean":
+                # Token-lean reading view: latest reply only, no raw HTML.
+                source = email_details["body"]
+                if not source and email_details["body_html"]:
+                    source = html_to_text(email_details["body_html"])
+                cleaned = clean_body(source, max_chars=4000)
+                email_details["body"] = cleaned["text"]
+                email_details.pop("body_html", None)
+                if cleaned["quoted_blocks_stripped"]:
+                    email_details["quoted_history"] = (
+                        f"stripped {cleaned['quoted_blocks_stripped']} quoted "
+                        "block(s) — use get_thread for the full conversation"
+                    )
+                if cleaned["truncated"]:
+                    email_details["body_truncated"] = True
 
             # Projection: when fields=[...] is provided, return only those
             # keys inside the ``email`` object. Default (no fields) keeps

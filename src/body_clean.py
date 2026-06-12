@@ -157,10 +157,12 @@ def strip_quoted_history(text: str) -> tuple[str, int]:
     """Cut the body at the first reply-history marker.
 
     Returns (latest-reply-only text, count of quoted blocks/markers found in
-    the stripped tail). Markers sitting on one of the first 2 non-empty
-    lines are ignored (a body that *starts* with a marker-like line
-    survives) — except an "Original Message" separator, which may cut even
-    that early. Trailing whitespace lines are stripped from the result.
+    the stripped tail). A marker sitting on the *first* non-empty line is
+    ignored (a body that genuinely starts with a marker-like line survives)
+    — except an "Original Message" separator, which may cut even that
+    early. The second non-empty line is NOT protected: a one-line reply
+    directly followed by the quoted chain is the most common email shape.
+    Trailing whitespace lines are stripped from the result.
     """
     if not text:
         return ("", 0)
@@ -169,7 +171,7 @@ def strip_quoted_history(text: str) -> tuple[str, int]:
     markers, runs = _find_markers(lines)
 
     nonempty = [i for i, ln in enumerate(lines) if ln.strip()]
-    protected = set(nonempty[:2])
+    protected = set(nonempty[:1])
 
     cut: int | None = None
     for idx, kind in markers:
