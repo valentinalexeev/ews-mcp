@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ews-mcp-v5"
+version = "5.0.0a1"
+description = "Greenfield EWS MCP server — 24 consolidated tools for an executive-mailbox agent-secretary (design/ews-mcp-fable-redo/IDEATION.md)"
+requires-python = ">=3.11"
+dependencies = [
+    "exchangelib==5.0.3",
+    "mcp>=1.27,<2",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.5",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+ewsmcp = "ewsmcp.main:main"
+
+[tool.setuptools.packages.find]
+include = ["ewsmcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
