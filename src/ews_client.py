@@ -1,6 +1,6 @@
 """Exchange Web Services client wrapper."""
 
-from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION, NTLM, BASIC, EWSTimeZone
+from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION, EWSTimeZone
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 import logging
@@ -114,19 +114,17 @@ class EWSClient:
 
                 self.logger.info(f"Using EWS endpoint: {ews_url}")
 
-                # Always use service_endpoint to bypass autodiscovery completely
-                config_kwargs = dict(
+                # Always use service_endpoint to bypass autodiscovery completely.
+                # We deliberately do NOT pin auth_type: corporate Exchange that
+                # answers 401 with multiple WWW-Authenticate schemes only
+                # authenticates via exchangelib's auto-negotiation — forcing
+                # BASIC or NTLM yields "Invalid credentials" (verified live).
+                config = Configuration(
                     service_endpoint=ews_url,
                     credentials=credentials,
                     retry_policy=None,  # Disable built-in retry, we handle it
-                    max_connections=self.config.connection_pool_size,
+                    max_connections=self.config.connection_pool_size
                 )
-                # Pin NTLM when requested — plain Credentials alone make
-                # exchangelib negotiate/Basic (the long-standing NTLM no-op).
-                auth_type = self._explicit_auth_type()
-                if auth_type is not None:
-                    config_kwargs["auth_type"] = auth_type
-                config = Configuration(**config_kwargs)
 
                 # Set timeout on the protocol
                 BaseProtocol.TIMEOUT = self.config.request_timeout
@@ -235,17 +233,14 @@ class EWSClient:
             use_manual_config = bool(self.config.ews_server_url)
 
             if use_manual_config:
-                # Reuse existing configuration with same endpoint
-                config_kwargs = dict(
+                # Reuse existing configuration with same endpoint (no auth_type
+                # pin — see the primary-account path above).
+                config = Configuration(
                     service_endpoint=self._get_ews_url(),
                     credentials=credentials,
                     retry_policy=None,
-                    max_connections=self.config.connection_pool_size,
+                    max_connections=self.config.connection_pool_size
                 )
-                auth_type = self._explicit_auth_type()
-                if auth_type is not None:
-                    config_kwargs["auth_type"] = auth_type
-                config = Configuration(**config_kwargs)
 
                 impersonated_account = Account(
                     primary_smtp_address=target_mailbox,
@@ -296,24 +291,6 @@ class EWSClient:
         else:
             server = ews_input.replace('https://', '').replace('http://', '').rstrip('/')
             return f"https://{server}/EWS/Exchange.asmx"
-
-    def _explicit_auth_type(self):
-        """Return the exchangelib auth_type to pin on Configuration, or None.
-
-        Pinning the configured scheme skips exchangelib's auth-type
-        auto-detection probe (a ``GET`` to the endpoint). That probe is
-        fragile against corporate Exchange that answers 401 with multiple
-        ``WWW-Authenticate`` schemes (Negotiate/NTLM/Basic): it raises
-        "Failed to get auth type from service", so a freshly-started
-        container fails its startup connection test. Both BASIC and NTLM are
-        pinned explicitly; OAuth2 is inferred from ``OAuth2Credentials`` and
-        needs no pin.
-        """
-        if self.config.ews_auth_type == "ntlm":
-            return NTLM
-        if self.config.ews_auth_type == "basic":
-            return BASIC
-        return None
 
     def clear_impersonation_cache(self) -> None:
         """Clear cached impersonated accounts."""

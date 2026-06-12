@@ -192,18 +192,6 @@ def test_calendar_item_save_accepts_send_meeting_invitations():
     )
 
 
-def test_configuration_accepts_auth_type():
-    """``ews_client._explicit_auth_type`` pins ``auth_type=NTLM`` on
-    ``Configuration`` for on-prem NTLM. If exchangelib renames/removes the
-    kwarg, NTLM auth silently regresses to Basic."""
-    from exchangelib import Configuration
-    params = set(inspect.signature(Configuration.__init__).parameters)
-    assert "auth_type" in params, (
-        "Configuration.__init__ lost auth_type — src/ews_client.py NTLM "
-        "pinning will break."
-    )
-
-
 def test_q_constructor_accepts_keyword_filters():
     """The advanced search builder constructs ``Q(subject__icontains=...)``
     and similar. ``Q`` is internal API; pin that the lookup we depend on
@@ -241,7 +229,6 @@ _KWARG_CONTRACTS = [
     ("exchangelib.Message.send", "save_copy", "present"),
     ("exchangelib.Account.fetch", "ids", "present"),
     ("exchangelib.CalendarItem.save", "send_meeting_invitations", "present"),
-    ("exchangelib.Configuration.__init__", "auth_type", "present"),
 ]
 
 

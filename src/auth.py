@@ -60,11 +60,11 @@ class AuthHandler:
     def _get_ntlm_credentials(self) -> Credentials:
         """Build credentials for NTLM auth.
 
-        The credential object is identical to Basic — username/password. What
-        actually selects NTLM is ``auth_type=NTLM`` pinned on the
-        ``Configuration`` by ``EWSClient._explicit_auth_type``; without that
-        pin exchangelib negotiates and falls back to Basic, which is why
-        ``EWS_AUTH_TYPE=ntlm`` previously behaved like Basic.
+        Returns username/password Credentials; exchangelib negotiates the
+        actual scheme with the server. We intentionally do NOT pin
+        ``auth_type`` on the Configuration — forcing BASIC or NTLM breaks
+        corporate Exchange that only authenticates via the auto-negotiated
+        scheme (verified live: pinning yields "Invalid credentials").
         """
         try:
             return Credentials(

@@ -14,11 +14,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict
 
-from exchangelib import NTLM, BASIC
-
 from src.config import Settings
-from src.auth import AuthHandler
-from src.ews_client import EWSClient
 from src.tools.base import BaseTool
 from src.tools.email_tools import SendEmailTool, ReplyEmailTool, ForwardEmailTool
 from src.tools.calendar_tools import RespondToMeetingTool
@@ -122,14 +118,3 @@ def test_whoami_flags_exchange_online_sunset():
     assert result["ews_sunset"]["removed_after"] == "2027-04-01"
 
 
-# --- NTLM auth_type pin -----------------------------------------------------
-
-
-def test_explicit_auth_type_pins_basic_and_ntlm():
-    # Both on-prem schemes are pinned to skip the fragile auth-type
-    # auto-detection probe; OAuth2 is inferred from OAuth2Credentials.
-    cfg_ntlm = _settings(ews_auth_type="ntlm")
-    assert EWSClient(cfg_ntlm, AuthHandler(cfg_ntlm))._explicit_auth_type() is NTLM
-
-    cfg_basic = _settings(ews_auth_type="basic")
-    assert EWSClient(cfg_basic, AuthHandler(cfg_basic))._explicit_auth_type() is BASIC
