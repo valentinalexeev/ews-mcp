@@ -28,6 +28,7 @@ from .middleware.rate_limiter import RateLimiter
 from .exceptions import EWSMCPException
 from .logging_system import get_logger
 from .openapi_adapter import OpenAPIAdapter
+from .tools.base import public_schema
 from .utils import safe_json_dumps
 
 # Import all tool classes (67 total: 63 base + 4 optional AI)
@@ -516,18 +517,19 @@ class EWSMCPServer:
         @self.server.list_tools()
         async def list_tools() -> list[Tool]:
             """List all available tools."""
-            return [
-                Tool(
-                    name=tool.get_schema()["name"],
-                    description=tool.get_schema()["description"],
-                    inputSchema=tool.get_schema()["inputSchema"],
+            tools = []
+            for tool in self.tools.values():
+                schema = public_schema(tool)
+                tools.append(Tool(
+                    name=schema["name"],
+                    description=schema["description"],
+                    inputSchema=schema["inputSchema"],
                     annotations=TOOL_ANNOTATIONS.get(
                         getattr(tool, "side_effect_class", "write"),
                         TOOL_ANNOTATIONS["write"],
                     ),
-                )
-                for tool in self.tools.values()
-            ]
+                ))
+            return tools
 
         @self.server.call_tool()
         async def call_tool(name: str, arguments: dict) -> list[TextContent]:
@@ -855,6 +857,28 @@ class EWSMCPServer:
             executor = ExecuteApprovedActionTool(self.ews_client, self.tools)
             executor_schema = executor.get_schema()
             self.tools[executor_schema["name"]] = executor
+
+        # Capability-tier filter: above-tier tools are removed from the
+        # registry entirely (not listed to models, absent from OpenAPI,
+        # refused by the shim). safe_execute double-checks at dispatch.
+        tier = str(getattr(self.settings, "ews_capability_tier", "full"))
+        if tier in ("read", "draft"):
+            tier_rank = {"read": 0, "draft": 1, "full": 2}
+            class_tier = {
+                "read": "read", "write": "draft",
+                "destructive": "full", "send": "full",
+            }
+            before = len(self.tools)
+            self.tools = {
+                name: tool for name, tool in self.tools.items()
+                if tier_rank[class_tier.get(
+                    getattr(tool, "side_effect_class", "write"), "draft"
+                )] <= tier_rank[tier]
+            }
+            self.logger.warning(
+                "capability tier '%s': %d above-tier tools removed from the "
+                "registry (%d remain)", tier, before - len(self.tools), len(self.tools),
+            )
 
         self.logger.info(f"Registered {len(self.tools)} tools: {', '.join(self.tools.keys())}")
 

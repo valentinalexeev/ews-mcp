@@ -795,6 +795,7 @@ class SendEmailTool(BaseTool):
     """Tool for sending emails."""
 
     side_effect_class = "send"
+    confirm_required = True  # two-phase: preview + token, then send
 
     def get_schema(self) -> Dict[str, Any]:
         return {
@@ -2293,6 +2294,10 @@ class GetEmailsBulkTool(BaseTool):
 class DeleteEmailTool(BaseTool):
     """Tool for deleting emails."""
 
+    def confirm_needed(self, kwargs: Dict[str, Any]) -> bool:
+        # Soft delete (→ Deleted Items) is reversible; permanent isn't.
+        return bool(kwargs.get("permanent") or kwargs.get("hard_delete"))
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "delete_email",
@@ -2648,6 +2653,7 @@ class ReplyEmailTool(BaseTool):
     """Tool for replying to emails while preserving conversation thread."""
 
     side_effect_class = "send"
+    confirm_required = True  # two-phase: preview + token, then send
 
     def get_schema(self) -> Dict[str, Any]:
         return {
@@ -2869,6 +2875,7 @@ class ForwardEmailTool(BaseTool):
     """Tool for forwarding emails to new recipients while preserving original content."""
 
     side_effect_class = "send"
+    confirm_required = True  # two-phase: preview + token, then send
 
     def get_schema(self) -> Dict[str, Any]:
         return {

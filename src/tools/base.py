@@ -14,9 +14,53 @@ import time
 from ..ews_client import EWSClient
 from ..exceptions import ValidationError, ToolExecutionError
 from ..id_alias import get_aliaser, kind_for_key
+from ..safety import content_hash, make_token, verify_token
 from ..utils import format_error_response
 from ..logging_system import get_logger
 from ..middleware.circuit_breaker import get_circuit_breaker
+
+# Capability tiers: read ⊂ draft ⊂ full. The configured tier
+# (EWS_CAPABILITY_TIER, default "full" = no behavior change) caps which
+# side-effect classes may run: read tools everywhere, reversible writes
+# from "draft", sends and destructive ops only in "full".
+_TIER_RANK = {"read": 0, "draft": 1, "full": 2}
+_CLASS_REQUIRED_TIER = {
+    "read": "read", "write": "draft", "destructive": "full", "send": "full",
+}
+
+# Recipient-bearing kwargs scanned by the confirm preview's
+# external-recipient warning.
+_RECIPIENT_KEYS = ("to", "cc", "bcc", "attendees", "required_attendees",
+                   "optional_attendees")
+
+# Injected into the published schema of every confirm-gated tool so the
+# model knows the two-phase contract without per-tool schema edits.
+CONFIRM_TOKEN_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Two-phase confirm: omit on the first call — you get a preview "
+        "plus a confirm_token and NOTHING executes. Call again with "
+        "identical arguments plus this token to actually execute. Tokens "
+        "are single-purpose, bound to the exact arguments, and expire."
+    ),
+}
+
+
+def tool_uses_confirm(tool: "BaseTool") -> bool:
+    """True when the central two-phase gate can fire for this tool."""
+    return bool(getattr(tool, "confirm_required", False)) or (
+        type(tool).confirm_needed is not BaseTool.confirm_needed
+    )
+
+
+def public_schema(tool: "BaseTool") -> Dict[str, Any]:
+    """The tool's schema as published to clients (MCP list_tools, OpenAPI),
+    with the confirm_token parameter injected for confirm-gated tools."""
+    schema = tool.get_schema()
+    if tool_uses_confirm(tool):
+        props = schema.get("inputSchema", {}).setdefault("properties", {})
+        props.setdefault("confirm_token", dict(CONFIRM_TOKEN_PROPERTY))
+    return schema
 
 # ---------------------------------------------------------------------------
 # Central id aliasing (token economy + move-stability)
@@ -129,6 +173,13 @@ class BaseTool(ABC):
     # background warmup is still trying to reach Exchange.
     requires_ews: bool = True
 
+    # Two-phase confirm: when True (or when ``confirm_needed`` says so for
+    # the given kwargs), the first call returns a preview + HMAC token and
+    # performs NO side effect; the side effect runs only on a second call
+    # carrying the (param-bound, TTL'd) token. send_draft keeps its own
+    # richer internal flow and stays False here.
+    confirm_required: bool = False
+
     def __init__(self, ews_client: EWSClient):
         self.ews_client = ews_client
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -171,6 +222,103 @@ class BaseTool(ABC):
         if target_mailbox and target_mailbox.lower() != self.ews_client.config.ews_email.lower():
             return target_mailbox
         return self.ews_client.config.ews_email
+
+    def confirm_needed(self, kwargs: Dict[str, Any]) -> bool:
+        """Whether THIS invocation needs the two-phase confirm. Tools with
+        conditional danger (hard delete, folder delete, OOF set) override."""
+        return self.confirm_required
+
+    def confirm_preview(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Human/model-readable preview for phase 1. Bodies are shown as a
+        200-char snippet — enough to confirm intent without re-shipping the
+        full content."""
+        preview: Dict[str, Any] = {}
+        for key, value in kwargs.items():
+            if key in ("body", "message", "comment") and isinstance(value, str):
+                preview[f"{key}_preview"] = value[:200]
+            else:
+                preview[key] = value
+        return preview
+
+    def _external_recipients(self, kwargs: Dict[str, Any]) -> list:
+        """Recipients outside the primary mailbox's domain (for warnings)."""
+        own_domain = (self.ews_client.config.ews_email or "").rsplit("@", 1)[-1].lower()
+        external = []
+        for key in _RECIPIENT_KEYS:
+            value = kwargs.get(key)
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list):
+                continue
+            for recipient in value:
+                if (
+                    isinstance(recipient, str) and "@" in recipient
+                    and recipient.rsplit("@", 1)[-1].lower() != own_domain
+                ):
+                    external.append(recipient)
+        return external
+
+    def mint_confirm_token(self, kwargs: Dict[str, Any]) -> str:
+        """Mint a valid phase-2 token for these exact kwargs.
+
+        Used by the approval-queue executor: a human already approved the
+        action, so the executor pre-confirms through the same HMAC
+        machinery instead of a forgeable bypass flag.
+        """
+        chash = content_hash(dict(kwargs))
+        tok = make_token(
+            mailbox=self.ews_client.config.ews_email,
+            action=self.get_schema()["name"],
+            target_id="-",
+            chash=chash,
+        )
+        return tok["confirm_token"]
+
+    def _confirm_gate(self, tool_name: str, kwargs: Dict[str, Any]):
+        """Two-phase confirm. Returns (kwargs, None) to proceed, or
+        (kwargs, response) to short-circuit with phase-1 preview/rejection.
+
+        The content hash binds the token to the exact pre-alias-resolution
+        kwargs (minus the token itself): any change between the previewed
+        phase 1 and phase 2 — or a token minted for a different tool —
+        verifies as stale.
+        """
+        kwargs = dict(kwargs)
+        token = kwargs.pop("confirm_token", None)
+        chash = content_hash(dict(kwargs))
+        mailbox = self.ews_client.config.ews_email
+        if not token:
+            tok = make_token(
+                mailbox=mailbox, action=tool_name, target_id="-", chash=chash,
+            )
+            response: Dict[str, Any] = {
+                "success": True,
+                "requires_confirmation": True,
+                "message": (
+                    f"{tool_name} previewed — NOTHING was executed. Review "
+                    "the preview, then call again with the same arguments "
+                    "plus confirm_token to proceed."
+                ),
+                "preview": self.confirm_preview(kwargs),
+                **tok,
+            }
+            external = self._external_recipients(kwargs)
+            if external:
+                response["warnings"] = [
+                    f"external recipients: {', '.join(sorted(set(external)))}"
+                ]
+            return kwargs, response
+        ok, reason = verify_token(
+            token, mailbox=mailbox, action=tool_name, target_id="-", chash=chash,
+        )
+        if not ok:
+            err = ValidationError(
+                f"confirm_token rejected ({reason}). Call {tool_name} again "
+                "WITHOUT confirm_token to get a fresh preview and token; "
+                "tokens die when any argument changes or after the TTL."
+            )
+            return kwargs, format_error_response(err, "")
+        return kwargs, None
 
     def _get_aliaser(self):
         """Process-wide id aliaser, or None when disabled/unavailable.
@@ -254,6 +402,31 @@ class BaseTool(ABC):
             )
             self._log_error("SendDisabled", tool_name, module_name, kwargs, err, duration_ms)
             return format_error_response(err, "")
+
+        # Capability tier gate: the configured tier caps which side-effect
+        # classes may run at all (read ⊂ draft ⊂ full). Registration-time
+        # filtering already hides above-tier tools; this is defense in
+        # depth for direct dispatch paths.
+        tier = str(getattr(self.ews_client.config, "ews_capability_tier", "full"))
+        required = _CLASS_REQUIRED_TIER.get(self.side_effect_class, "draft")
+        if _TIER_RANK[required] > _TIER_RANK.get(tier, _TIER_RANK["full"]):
+            duration_ms = int((time.time() - start_time) * 1000)
+            err = ToolExecutionError(
+                f"{tool_name} is blocked: this server runs in capability "
+                f"tier '{tier}' and {self.side_effect_class}-class tools "
+                f"need tier '{required}'. (EWS_CAPABILITY_TIER governs this.)"
+            )
+            self._log_error("TierBlocked", tool_name, module_name, kwargs, err, duration_ms)
+            return format_error_response(err, "")
+
+        # Two-phase confirm for irreversible/externally-visible operations:
+        # phase 1 (no token) previews and does nothing; phase 2 requires
+        # the param-bound token. Runs BEFORE alias resolution so both
+        # phases hash the caller's literal arguments.
+        if self.confirm_needed(kwargs):
+            kwargs, confirm_response = self._confirm_gate(tool_name, kwargs)
+            if confirm_response is not None:
+                return confirm_response
 
         # Alias resolution: accept short ids (m12, e3, ...) anywhere a
         # tool takes an id. A stale alias is a clean user error with a

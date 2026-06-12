@@ -1,8 +1,9 @@
 """OpenAPI adapter for MCP tools - provides REST API compatibility."""
 
 import json
-from typing import Any, Dict, List, Optional
-from datetime import datetime
+from typing import Any, Dict, Optional
+
+from .tools.base import public_schema
 
 
 class OpenAPIAdapter:
@@ -25,7 +26,8 @@ class OpenAPIAdapter:
         paths = {}
 
         for tool_name, tool in self.tools.items():
-            schema = tool.get_schema()
+            # public_schema injects confirm_token for confirm-gated tools.
+            schema = public_schema(tool)
 
             # Convert MCP tool schema to OpenAPI path
             path = f"/api/tools/{tool_name}"

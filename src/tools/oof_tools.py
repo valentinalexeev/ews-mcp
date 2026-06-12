@@ -16,6 +16,11 @@ class OofSettingsTool(BaseTool):
     Replaces: get_oof_settings, set_oof_settings.
     """
 
+    def confirm_needed(self, kwargs: Dict[str, Any]) -> bool:
+        # Setting OOF changes externally-visible auto-reply behavior for
+        # every correspondent — confirm it; reading is free.
+        return kwargs.get("action") == "set"
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "oof_settings",

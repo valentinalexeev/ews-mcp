@@ -604,7 +604,10 @@ class DeleteAppointmentTool(BaseTool):
 class RespondToMeetingTool(BaseTool):
     """Tool for responding to meeting invitations."""
 
+    # Accept/decline transmits a response message to the organizer
+    # immediately — send-class, and two-phase confirmed.
     side_effect_class = "send"
+    confirm_required = True
 
     def get_schema(self) -> Dict[str, Any]:
         return {

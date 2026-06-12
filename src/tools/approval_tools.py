@@ -307,7 +307,16 @@ class ExecuteApprovedActionTool(BaseTool):
 
         # Delegate to the real tool. safe_execute gives us the usual error
         # handling, circuit breaker, audit log, etc.
-        result = await tool.safe_execute(**approval.arguments)
+        #
+        # Two-phase confirm interplay: a human already approved this exact
+        # action, so the executor pre-confirms by minting a valid token
+        # through the same HMAC machinery (no forgeable bypass flag — the
+        # secret never leaves the server). The kill-switch and capability
+        # tier still apply inside safe_execute.
+        arguments = dict(approval.arguments)
+        if tool.confirm_needed(arguments) and "confirm_token" not in arguments:
+            arguments["confirm_token"] = tool.mint_confirm_token(arguments)
+        result = await tool.safe_execute(**arguments)
         return format_success_response(
             "Approved action executed",
             approval_id=approval_id,

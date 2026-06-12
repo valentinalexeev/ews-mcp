@@ -403,6 +403,11 @@ class ManageFolderTool(BaseTool):
     Replaces: create_folder, delete_folder, rename_folder, move_folder.
     """
 
+    def confirm_needed(self, kwargs: Dict[str, Any]) -> bool:
+        # Deleting a folder (and whatever it contains) is the one
+        # irreversible action in this tool's repertoire.
+        return kwargs.get("action") == "delete"
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "manage_folder",

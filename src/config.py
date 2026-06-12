@@ -146,6 +146,17 @@ class Settings(BaseSettings):
             "keep working everywhere."
         ),
     )
+    ews_capability_tier: Literal["read", "draft", "full"] = Field(
+        default="full",
+        description=(
+            "Capability ceiling: 'read' = read-only tools; 'draft' adds "
+            "reversible writes (drafts, flags, moves, soft delete); 'full' "
+            "adds send + destructive classes. Above-tier tools are removed "
+            "from the registry at startup AND refused at dispatch. Default "
+            "'full' preserves historical behavior; run 'draft' against a "
+            "production mailbox you must not send from."
+        ),
+    )
 
     # Rate limiting
     rate_limit_enabled: bool = True
