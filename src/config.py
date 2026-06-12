@@ -122,6 +122,22 @@ class Settings(BaseSettings):
             "transient 503s before raising."
         ),
     )
+    ews_offload_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run EWS-touching tool bodies on a bounded worker pool instead "
+            "of inline on the event loop (rollback switch: false restores "
+            "the historical inline path)."
+        ),
+    )
+    ews_max_concurrency: int = Field(
+        default=4,
+        description=(
+            "Worker pool size = max concurrent EWS operations. Keep well "
+            "under the on-prem EWSMaxConcurrency budget (27 on 2013+), "
+            "which is per-user and shared with Outlook/OWA."
+        ),
+    )
 
     # Rate limiting
     rate_limit_enabled: bool = True

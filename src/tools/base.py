@@ -1,6 +1,9 @@
 """Base class for all MCP tools."""
 
+import asyncio
+import threading
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Type, Optional
 from pydantic import BaseModel, ValidationError as PydanticValidationError
 from exchangelib import Account
@@ -12,6 +15,26 @@ from ..exceptions import ValidationError, ToolExecutionError
 from ..utils import format_error_response
 from ..logging_system import get_logger
 from ..middleware.circuit_breaker import get_circuit_breaker
+
+# Dedicated bounded executor for EWS-touching tool bodies. exchangelib is
+# synchronous: running it inline in async handlers froze the whole event
+# loop (all concurrent requests, SSE keepalives, /health) for the duration
+# of every Exchange round-trip. Tool bodies now run on this pool — its
+# size doubles as the EWS concurrency cap, keeping us a polite guest on
+# the mailbox's shared throttling budget (EWSMaxConcurrency is per-user
+# and shared with the executive's own Outlook/OWA).
+_EWS_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_EWS_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_ews_executor(max_workers: int) -> ThreadPoolExecutor:
+    global _EWS_EXECUTOR
+    with _EWS_EXECUTOR_LOCK:
+        if _EWS_EXECUTOR is None:
+            _EWS_EXECUTOR = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="ews-tool"
+            )
+        return _EWS_EXECUTOR
 
 
 class BaseTool(ABC):
@@ -152,7 +175,7 @@ class BaseTool(ABC):
         )
 
         try:
-            result = await self.execute(**kwargs)
+            result = await self._run_execute(**kwargs)
             duration_ms = int((time.time() - start_time) * 1000)
 
             # Record success with circuit breaker
@@ -212,6 +235,33 @@ class BaseTool(ABC):
             self.logger.exception("Unexpected error in tool execution")
             self._log_error("UnexpectedError", tool_name, module_name, kwargs, e, duration_ms)
             return format_error_response(e, "Unexpected error")
+
+    async def _run_execute(self, **kwargs) -> Dict[str, Any]:
+        """Run ``execute()`` — off the event loop for EWS-touching tools.
+
+        The tool body (an async def whose awaits are cheap but whose
+        exchangelib calls block) runs under ``asyncio.run`` on a bounded
+        worker thread, so one slow Exchange round-trip can't freeze every
+        other request. Local tools (requires_ews=False) and deployments
+        that set EWS_OFFLOAD_ENABLED=false keep the historical inline
+        path. Caveat: cancellation of the outer task does not interrupt
+        an in-flight worker call — exchangelib offers no cancel anyway.
+        """
+        cfg = self.ews_client.config
+        offload = self.requires_ews and bool(
+            getattr(cfg, "ews_offload_enabled", True)
+        )
+        if not offload:
+            return await self.execute(**kwargs)
+        try:
+            max_workers = int(getattr(cfg, "ews_max_concurrency", 4))
+        except (TypeError, ValueError):
+            max_workers = 4
+        loop = asyncio.get_running_loop()
+        executor = _get_ews_executor(max_workers)
+        return await loop.run_in_executor(
+            executor, lambda: asyncio.run(self.execute(**kwargs))
+        )
 
     def _log_error(self, error_type: str, tool_name: str, module_name: str,
                    kwargs: Dict, error: Exception, duration_ms: int):
