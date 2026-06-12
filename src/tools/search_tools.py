@@ -5,13 +5,13 @@ Provides:
   across the entire mailbox (or a caller-specified subset).
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 from datetime import datetime
 
 from .base import BaseTool
 from ..exceptions import ToolExecutionError, ValidationError
 from ..utils import (
-    format_success_response, safe_get, truncate_text, parse_datetime_tz_aware,
+    format_success_response, safe_get, truncate_text,
     find_message_across_folders, ews_id_to_str, format_datetime,
     project_fields, strip_body_by_default, LIST_DEFAULT_FIELDS,
     ews_call_log,
@@ -328,3 +328,101 @@ class SearchByConversationTool(BaseTool):
             raise ToolExecutionError(
                 f"Failed to search by conversation: {type(e).__name__}: {e}"
             )
+
+
+class GetThreadTool(BaseTool):
+    """Reconstruct a conversation into a single thread DTO (oldest→newest).
+
+    Reuses ``search_by_conversation`` to gather the messages, then assembles
+    a participants rollup, date range, and the message list in chronological
+    order — the single highest-value read for a secretary. ``bodies`` keeps
+    the response token-lean: ``none``, ``latest`` (default) or ``all``.
+    """
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "get_thread",
+            "description": (
+                "Reconstruct a whole conversation into one thread object: "
+                "thread_id, participants, message_count, date range, and the "
+                "messages oldest→newest. Pass message_id OR conversation_id. "
+                "bodies controls text volume: 'none', 'latest' (default — full "
+                "text only for the newest message) or 'all'."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "Any message in the thread"},
+                    "conversation_id": {"type": "string", "description": "Conversation id (alternative to message_id)"},
+                    "max_messages": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+                    "bodies": {"type": "string", "enum": ["none", "latest", "all"], "default": "latest"},
+                    "target_mailbox": {"type": "string"},
+                },
+                "required": [],
+            },
+        }
+
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        message_id = kwargs.get("message_id")
+        conversation_id = kwargs.get("conversation_id")
+        if not message_id and not conversation_id:
+            raise ValidationError("Either message_id or conversation_id is required")
+        max_messages = int(kwargs.get("max_messages", 50))
+        bodies = kwargs.get("bodies", "latest")
+        if bodies not in ("none", "latest", "all"):
+            bodies = "latest"
+        target_mailbox = kwargs.get("target_mailbox")
+
+        fields = list(LIST_DEFAULT_FIELDS)
+        if bodies in ("latest", "all"):
+            fields.append("body")
+
+        # Reuse the tested conversation walk. Call execute() directly (not
+        # safe_execute) so we don't nest circuit-breaker/audit layers.
+        conv = SearchByConversationTool(self.ews_client)
+        res = await conv.execute(
+            message_id=message_id,
+            conversation_id=conversation_id,
+            include_all_folders=True,
+            max_results=max_messages,
+            fields=fields,
+            target_mailbox=target_mailbox,
+        )
+        items = res.get("items", []) or []
+
+        # Oldest → newest. ISO received_time strings sort chronologically;
+        # blank timestamps sort first.
+        messages = sorted(items, key=lambda x: x.get("received_time") or "")
+        truncated = len(messages) >= max_messages
+
+        if bodies == "latest":
+            for m in messages[:-1]:
+                m.pop("body", None)
+
+        participants: List[str] = []
+        seen: Set[str] = set()
+        for m in messages:
+            frm = m.get("from") or ""
+            if frm and frm not in seen:
+                seen.add(frm)
+                participants.append(frm)
+
+        received = [m.get("received_time") for m in messages if m.get("received_time")]
+        date_range = [received[0], received[-1]] if received else []
+        latest = messages[-1] if messages else None
+        subject = (latest or {}).get("subject") or next(
+            (m.get("subject") for m in messages if m.get("subject")), ""
+        )
+
+        return format_success_response(
+            f"Thread with {len(messages)} message(s)",
+            thread_id=res.get("conversation_id"),
+            subject=subject,
+            message_count=len(messages),
+            participants=participants,
+            date_range=date_range,
+            messages=messages,
+            latest=latest,
+            truncated=truncated,
+            mailbox=res.get("mailbox"),
+        )

@@ -1,6 +1,6 @@
 """Authentication handlers for Exchange Web Services."""
 
-from exchangelib import Credentials, OAuth2Credentials, NTLM
+from exchangelib import Credentials, OAuth2Credentials
 import logging
 
 from .config import Settings
@@ -58,7 +58,14 @@ class AuthHandler:
             raise AuthenticationError(f"Basic auth failed: {e}")
 
     def _get_ntlm_credentials(self) -> Credentials:
-        """Get NTLM credentials."""
+        """Build credentials for NTLM auth.
+
+        The credential object is identical to Basic — username/password. What
+        actually selects NTLM is ``auth_type=NTLM`` pinned on the
+        ``Configuration`` by ``EWSClient._explicit_auth_type``; without that
+        pin exchangelib negotiates and falls back to Basic, which is why
+        ``EWS_AUTH_TYPE=ntlm`` previously behaved like Basic.
+        """
         try:
             return Credentials(
                 username=self.config.ews_username,

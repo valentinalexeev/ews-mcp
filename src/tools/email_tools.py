@@ -785,6 +785,8 @@ async def resolve_folder(ews_client, folder_identifier: str):
 class SendEmailTool(BaseTool):
     """Tool for sending emails."""
 
+    side_effect_class = "send"
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "send_email",
@@ -2532,6 +2534,8 @@ class CopyEmailTool(BaseTool):
 class ReplyEmailTool(BaseTool):
     """Tool for replying to emails while preserving conversation thread."""
 
+    side_effect_class = "send"
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "reply_email",
@@ -2750,6 +2754,8 @@ class ReplyEmailTool(BaseTool):
 
 class ForwardEmailTool(BaseTool):
     """Tool for forwarding emails to new recipients while preserving original content."""
+
+    side_effect_class = "send"
 
     def get_schema(self) -> Dict[str, Any]:
         return {

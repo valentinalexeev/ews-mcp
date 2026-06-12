@@ -2,11 +2,13 @@
 
 from .email_tools import SendEmailTool, ReadEmailsTool, SearchEmailsTool, GetEmailDetailsTool, GetEmailsBulkTool, DeleteEmailTool, MoveEmailTool, UpdateEmailTool, CopyEmailTool, ReplyEmailTool, ForwardEmailTool
 from .email_tools_draft import CreateDraftTool, CreateReplyDraftTool, CreateForwardDraftTool
-from .calendar_tools import CreateAppointmentTool, GetCalendarTool, UpdateAppointmentTool, DeleteAppointmentTool, RespondToMeetingTool, CheckAvailabilityTool, FindMeetingTimesTool
+from .draft_send_tools import SendDraftTool, UpdateDraftTool
+from .batch_email_tools import UpdateMessagesTool, MoveMessagesTool, DeleteMessagesTool
+from .calendar_tools import CreateAppointmentTool, GetCalendarTool, UpdateAppointmentTool, DeleteAppointmentTool, RespondToMeetingTool, CheckAvailabilityTool, FindMeetingTimesTool, GetEventTool
 from .contact_tools import CreateContactTool, UpdateContactTool, DeleteContactTool
 from .task_tools import CreateTaskTool, GetTasksTool, UpdateTaskTool, CompleteTaskTool, DeleteTaskTool
 from .attachment_tools import ListAttachmentsTool, DownloadAttachmentTool, AddAttachmentTool, DeleteAttachmentTool, ReadAttachmentTool, GetEmailMimeTool, AttachEmailToDraftTool
-from .search_tools import SearchByConversationTool
+from .search_tools import SearchByConversationTool, GetThreadTool
 from .folder_tools import ListFoldersTool, FindFolderTool, ManageFolderTool
 from .oof_tools import OofSettingsTool
 from .ai_tools import SemanticSearchEmailsTool, ClassifyEmailTool, SummarizeEmailTool, SuggestRepliesTool
@@ -43,6 +45,7 @@ from .oof_policy_tools import (
 )
 from .briefing_tools import GenerateBriefingTool
 from .meeting_prep_tools import PrepareMeetingTool
+from .meta_tools import WhoamiTool
 
 __all__ = [
     # Email tools (11)
@@ -60,6 +63,11 @@ __all__ = [
     "CopyEmailTool",
     "ReplyEmailTool",
     "ForwardEmailTool",
+    "SendDraftTool",
+    "UpdateDraftTool",
+    "UpdateMessagesTool",
+    "MoveMessagesTool",
+    "DeleteMessagesTool",
     # Calendar tools (7)
     "CreateAppointmentTool",
     "GetCalendarTool",
@@ -68,6 +76,7 @@ __all__ = [
     "RespondToMeetingTool",
     "CheckAvailabilityTool",
     "FindMeetingTimesTool",
+    "GetEventTool",
     # Contact tools (3)
     "CreateContactTool",
     "UpdateContactTool",
@@ -86,8 +95,9 @@ __all__ = [
     "ReadAttachmentTool",
     "GetEmailMimeTool",
     "AttachEmailToDraftTool",
-    # Search tools (1)
+    # Search tools (2)
     "SearchByConversationTool",
+    "GetThreadTool",
     # Folder tools (3)
     "ListFoldersTool",
     "FindFolderTool",
@@ -135,4 +145,6 @@ __all__ = [
     # Compound tools (2)
     "GenerateBriefingTool",
     "PrepareMeetingTool",
+    # Meta (1)
+    "WhoamiTool",
 ]

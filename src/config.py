@@ -119,6 +119,15 @@ class Settings(BaseSettings):
     enable_audit_log: bool = True
     max_attachment_size: int = 157286400  # 150MB
 
+    # Global send kill-switch. When False, every tool whose action leaves the
+    # trust boundary (send_email, reply_email, forward_email,
+    # respond_to_meeting) refuses *before* any network call and returns a
+    # clean error. Reads, drafts, moves, flags and calendar reads are
+    # unaffected. Lets the server run in a safe read+draft mode against a
+    # production mailbox. Enforced centrally in BaseTool.safe_execute via each
+    # tool's ``side_effect_class``.
+    send_enabled: bool = True
+
     # Impersonation/Delegation settings
     ews_impersonation_enabled: bool = Field(
         default=False,

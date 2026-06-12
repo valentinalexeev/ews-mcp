@@ -17,6 +17,12 @@ from ..middleware.circuit_breaker import get_circuit_breaker
 class BaseTool(ABC):
     """Base class for all MCP tools with integrated logging."""
 
+    # Side-effect classification consumed by the central safety gate in
+    # ``safe_execute``. Tools whose action leaves the trust boundary set
+    # ``"send"`` and are refused when SEND_ENABLED=false. Subclasses override;
+    # the default is the conservative ``"write"``.
+    side_effect_class: str = "write"
+
     def __init__(self, ews_client: EWSClient):
         self.ews_client = ews_client
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -85,6 +91,22 @@ class BaseTool(ABC):
             cb.check()
         except ToolExecutionError as e:
             return format_error_response(e, "")
+
+        # Global send kill switch: refuse trust-boundary-leaving operations
+        # when SEND_ENABLED=false, before the attempt log and before
+        # execute(), so nothing reaches Exchange. Covers the approval-executor
+        # path too (ExecuteApprovedActionTool routes through safe_execute).
+        if self.side_effect_class == "send" and not getattr(
+            self.ews_client.config, "send_enabled", True
+        ):
+            duration_ms = int((time.time() - start_time) * 1000)
+            err = ToolExecutionError(
+                f"{tool_name} is blocked: SEND_ENABLED=false. Outbound sending "
+                "is disabled on this server. Create a draft instead, or set "
+                "SEND_ENABLED=true to allow sending."
+            )
+            self._log_error("SendDisabled", tool_name, module_name, kwargs, err, duration_ms)
+            return format_error_response(err, "")
 
         # Log attempt
         self.log_manager.log_activity(

@@ -1,0 +1,5 @@
+# Pin the Python version so version-gated builtins (e.g. BaseExceptionGroup,
+# a 3.11+ builtin from PEP 654 used in src/main.py's TaskGroup handling) are
+# recognized and not flagged F821. Runtime target is Python 3.11+ (CI matrix
+# runs 3.11/3.12; the Docker image is python:3.x-slim >= 3.11).
+target-version = "py311"

@@ -1,10 +1,9 @@
 """Exchange Web Services client wrapper."""
 
-from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION, Version, EWSTimeZone
+from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION, NTLM, EWSTimeZone
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_not_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 import logging
-import pytz
 from typing import Optional, Dict
 
 from .config import Settings
@@ -116,12 +115,18 @@ class EWSClient:
                 self.logger.info(f"Using EWS endpoint: {ews_url}")
 
                 # Always use service_endpoint to bypass autodiscovery completely
-                config = Configuration(
+                config_kwargs = dict(
                     service_endpoint=ews_url,
                     credentials=credentials,
                     retry_policy=None,  # Disable built-in retry, we handle it
-                    max_connections=self.config.connection_pool_size
+                    max_connections=self.config.connection_pool_size,
                 )
+                # Pin NTLM when requested — plain Credentials alone make
+                # exchangelib negotiate/Basic (the long-standing NTLM no-op).
+                auth_type = self._explicit_auth_type()
+                if auth_type is not None:
+                    config_kwargs["auth_type"] = auth_type
+                config = Configuration(**config_kwargs)
 
                 # Set timeout on the protocol
                 BaseProtocol.TIMEOUT = self.config.request_timeout
@@ -231,12 +236,16 @@ class EWSClient:
 
             if use_manual_config:
                 # Reuse existing configuration with same endpoint
-                config = Configuration(
+                config_kwargs = dict(
                     service_endpoint=self._get_ews_url(),
                     credentials=credentials,
                     retry_policy=None,
-                    max_connections=self.config.connection_pool_size
+                    max_connections=self.config.connection_pool_size,
                 )
+                auth_type = self._explicit_auth_type()
+                if auth_type is not None:
+                    config_kwargs["auth_type"] = auth_type
+                config = Configuration(**config_kwargs)
 
                 impersonated_account = Account(
                     primary_smtp_address=target_mailbox,
@@ -287,6 +296,19 @@ class EWSClient:
         else:
             server = ews_input.replace('https://', '').replace('http://', '').rstrip('/')
             return f"https://{server}/EWS/Exchange.asmx"
+
+    def _explicit_auth_type(self):
+        """Return the exchangelib auth_type to pin on Configuration, or None.
+
+        NTLM must be pinned explicitly: a plain ``Credentials`` without
+        ``auth_type=NTLM`` makes exchangelib negotiate and effectively use
+        Basic, so ``EWS_AUTH_TYPE=ntlm`` silently behaved like Basic before.
+        OAuth2 is inferred from ``OAuth2Credentials`` and Basic is the
+        negotiated default, so only NTLM needs an explicit pin here.
+        """
+        if self.config.ews_auth_type == "ntlm":
+            return NTLM
+        return None
 
     def clear_impersonation_cache(self) -> None:
         """Clear cached impersonated accounts."""

@@ -13,7 +13,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    continue-on-error: true  # Make entire job non-blocking
     strategy:
       fail-fast: false  # Don't cancel other matrix jobs on failure
       matrix:
@@ -34,7 +33,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest pytest-cov pytest-asyncio mypy ruff || echo "Dev dependencies install issues (non-blocking)"
-        continue-on-error: true
 
       - name: Run linter (ruff)
         run: |
@@ -48,8 +46,7 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest tests/ -v || echo "Some tests failed (non-blocking)"
-        continue-on-error: true
+          pytest tests/ -v
 
       - name: Run tests with coverage
         run: |

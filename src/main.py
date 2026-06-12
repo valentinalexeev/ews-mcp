@@ -34,10 +34,12 @@ from .tools import (
     SendEmailTool, ReadEmailsTool, SearchEmailsTool, GetEmailDetailsTool, GetEmailsBulkTool,
     DeleteEmailTool, MoveEmailTool, UpdateEmailTool, CopyEmailTool,
     ReplyEmailTool, ForwardEmailTool,
-    # Calendar tools (7)
+    SendDraftTool, UpdateDraftTool,
+    UpdateMessagesTool, MoveMessagesTool, DeleteMessagesTool,
+    # Calendar tools (8)
     CreateAppointmentTool, GetCalendarTool, UpdateAppointmentTool,
     DeleteAppointmentTool, RespondToMeetingTool, CheckAvailabilityTool,
-    FindMeetingTimesTool,
+    FindMeetingTimesTool, GetEventTool,
     # Contact tools (3) — search/get/resolve merged into FindPersonTool
     CreateContactTool, UpdateContactTool, DeleteContactTool,
     # Task tools (5)
@@ -47,8 +49,8 @@ from .tools import (
     ListAttachmentsTool, DownloadAttachmentTool,
     AddAttachmentTool, DeleteAttachmentTool, ReadAttachmentTool,
     GetEmailMimeTool, AttachEmailToDraftTool,
-    # Search tools (1) — advanced_search/full_text_search merged into search_emails
-    SearchByConversationTool,
+    # Search tools (2) — search_by_conversation + get_thread
+    SearchByConversationTool, GetThreadTool,
     # Folder tools (3) — create/delete/rename/move merged into manage_folder
     ListFoldersTool, FindFolderTool, ManageFolderTool,
     # Out-of-Office tools (1) — get/set merged into oof_settings
@@ -76,6 +78,8 @@ from .tools import (
     ConfigureOOFPolicyTool, GetOOFPolicyTool, ApplyOOFPolicyTool,
     # Compound tools (2)
     GenerateBriefingTool, PrepareMeetingTool,
+    # Meta (1) — identity/health self-report
+    WhoamiTool,
 )
 
 
@@ -676,9 +680,14 @@ class EWSMCPServer:
                 UpdateEmailTool,
                 CopyEmailTool,
                 ReplyEmailTool,
-                ForwardEmailTool
+                ForwardEmailTool,
+                SendDraftTool,
+                UpdateDraftTool,
+                UpdateMessagesTool,
+                MoveMessagesTool,
+                DeleteMessagesTool
             ])
-            self.logger.info("Email tools enabled (14 tools)")
+            self.logger.info("Email tools enabled (19 tools)")
 
         # Attachment tools (7 tools)
         if self.settings.enable_email:
@@ -702,9 +711,10 @@ class EWSMCPServer:
                 DeleteAppointmentTool,
                 RespondToMeetingTool,
                 CheckAvailabilityTool,
-                FindMeetingTimesTool
+                FindMeetingTimesTool,
+                GetEventTool
             ])
-            self.logger.info("Calendar tools enabled (7 tools)")
+            self.logger.info("Calendar tools enabled (8 tools)")
 
         # Contact tools (3 tools — search/get/resolve merged into find_person)
         if self.settings.enable_contacts:
@@ -734,11 +744,12 @@ class EWSMCPServer:
             ])
             self.logger.info("Task tools enabled (5 tools)")
 
-        # Search tools (1 tool — search_by_conversation)
+        # Search tools (2 tools — search_by_conversation + get_thread)
         tool_classes.extend([
-            SearchByConversationTool
+            SearchByConversationTool,
+            GetThreadTool
         ])
-        self.logger.info("Search tools enabled (1 tool)")
+        self.logger.info("Search tools enabled (2 tools)")
 
         # Folder tools (3 tools — list_folders + find_folder + manage_folder)
         tool_classes.extend([
@@ -798,6 +809,11 @@ class EWSMCPServer:
             tool = tool_class(self.ews_client)
             schema = tool.get_schema()
             self.tools[schema["name"]] = tool
+
+        # whoami: identity/health self-report. Available regardless of feature
+        # flags and wired after the loop so it can report the full tool count.
+        whoami_tool = WhoamiTool(self.ews_client, self.tools)
+        self.tools[whoami_tool.get_schema()["name"]] = whoami_tool
 
         # ExecuteApprovedActionTool needs the tool registry, so wire it after
         # every other tool is in place. This is why it isn't in the block

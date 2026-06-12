@@ -1,12 +1,12 @@
 """Calendar operation tools for EWS MCP Server."""
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 from exchangelib import CalendarItem, Mailbox, Attendee, EWSTimeZone
 
 from .base import BaseTool
-from ..models import CreateAppointmentRequest, MeetingResponse
+from ..models import CreateAppointmentRequest
 from ..exceptions import ToolExecutionError, ValidationError
 from ..utils import format_success_response, safe_get, parse_datetime_tz_aware, make_tz_aware, format_datetime, ews_id_to_str, attach_inline_files, INLINE_ATTACHMENTS_SCHEMA, get_timezone as get_configured_timezone
 
@@ -351,6 +351,11 @@ class GetCalendarTool(BaseTool):
             return format_success_response(
                 f"Retrieved {len(events)} events",
                 events=events,
+                # Canonical envelope aliases. ``events`` is kept for back-compat
+                # with existing callers (e.g. downstream callers' items_of()), while
+                # ``items``/``count`` align with the paged-search envelope.
+                items=events,
+                count=len(events),
                 start_date=start_date.isoformat(),
                 end_date=end_date.isoformat(),
                 mailbox=mailbox
@@ -359,6 +364,85 @@ class GetCalendarTool(BaseTool):
         except Exception as e:
             self.logger.error(f"Failed to get calendar: {e}")
             raise ToolExecutionError(f"Failed to get calendar: {e}")
+
+
+class GetEventTool(BaseTool):
+    """Fetch a single calendar event with full detail (attendees, body, recurrence)."""
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "get_event",
+            "description": (
+                "Get full detail for a single calendar event by id: attendees "
+                "with response status, organizer, body, recurrence flags and "
+                "iCal uid. Complements get_calendar (which lists a range)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "Calendar item id (from get_calendar)"},
+                    "event_id": {"type": "string", "description": "Alias for item_id"},
+                    "max_body_chars": {"type": "integer", "default": 4000, "minimum": 0},
+                    "target_mailbox": {"type": "string"},
+                },
+                "required": [],
+            },
+        }
+
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        item_id = kwargs.get("item_id") or kwargs.get("event_id")
+        if not item_id:
+            raise ToolExecutionError("item_id (or event_id) is required")
+        max_body = int(kwargs.get("max_body_chars", 4000))
+        target_mailbox = kwargs.get("target_mailbox")
+        account = self.get_account(target_mailbox)
+        mailbox = self.get_mailbox_info(target_mailbox)
+
+        try:
+            item = account.calendar.get(id=item_id)
+        except Exception as e:
+            raise ToolExecutionError(f"Event not found: {item_id} ({type(e).__name__})")
+
+        def _att(att_list) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for att in (att_list or []):
+                mb = safe_get(att, "mailbox", None)
+                if not mb:
+                    continue
+                out.append({
+                    "email": safe_get(mb, "email_address", "") or "",
+                    "name": safe_get(mb, "name", "") or "",
+                    "response": safe_get(att, "response_type", None),
+                })
+            return out
+
+        organizer = safe_get(item, "organizer", None)
+        organizer_email = (safe_get(organizer, "email_address", "") if organizer else "") or ""
+
+        body_text = safe_get(item, "text_body", None) or str(safe_get(item, "body", "") or "")
+        body_truncated = len(body_text) > max_body
+
+        start = safe_get(item, "start", None)
+        end = safe_get(item, "end", None)
+
+        event = {
+            "item_id": ews_id_to_str(safe_get(item, "id", None)) or item_id,
+            "ical_uid": safe_get(item, "uid", None),
+            "subject": safe_get(item, "subject", "") or "",
+            "start": start.isoformat() if start is not None else None,
+            "end": end.isoformat() if end is not None else None,
+            "location": safe_get(item, "location", "") or "",
+            "is_all_day": safe_get(item, "is_all_day", False),
+            "is_recurring": safe_get(item, "is_recurring", False),
+            "is_meeting": safe_get(item, "is_meeting", False),
+            "organizer": organizer_email,
+            "my_response": safe_get(item, "my_response_type", None),
+            "required_attendees": _att(safe_get(item, "required_attendees", [])),
+            "optional_attendees": _att(safe_get(item, "optional_attendees", [])),
+            "body": body_text[:max_body] if max_body else "",
+            "body_truncated": body_truncated,
+        }
+        return format_success_response("Event retrieved", event=event, mailbox=mailbox)
 
 
 class UpdateAppointmentTool(BaseTool):
@@ -519,6 +603,8 @@ class DeleteAppointmentTool(BaseTool):
 
 class RespondToMeetingTool(BaseTool):
     """Tool for responding to meeting invitations."""
+
+    side_effect_class = "send"
 
     def get_schema(self) -> Dict[str, Any]:
         return {
@@ -749,23 +835,34 @@ class CheckAvailabilityTool(BaseTool):
                         slot for slot in result["slot_summaries"] if slot["code"] != "0"
                     ]
 
+                # Pass the *raw* exchangelib events here, not the
+                # post-processed response dicts. summarize_availability uses
+                # safe_get (getattr) to read busy_type — getattr on a dict
+                # returns the default, so WorkingElsewhere events silently
+                # disappeared from the summary. (Tool-response key drift,
+                # CLAUDE.md pitfall #4.)
                 result["availability_summary"] = summarize_availability(
                     merged_free_busy=merged_free_busy,
-                    calendar_events=result["calendar_events"],
+                    calendar_events=calendar_events,
                 )
 
                 availability_results.append(result)
 
             self.logger.info(f"Retrieved availability for {len(normalized_emails)} users")
 
-            # Extract tz offset suffix defensively — a naive datetime's
-            # isoformat() has no ``+00:00`` tail, so the old ``[-6:]``
-            # slice returned garbage. Fall back to empty string.
+            # Extract tz offset from the parsed datetime via utcoffset().
+            # The earlier substring approach checked for "+" and "Z" but
+            # silently dropped negative offsets like "-08:00", so callers
+            # in PST/EST got an empty response_timezone.
             response_tz = ""
             try:
-                iso = display_start_time.isoformat()
-                if "+" in iso[10:] or iso.endswith(("Z",)):
-                    response_tz = iso[-6:] if iso.endswith(("+00:00", "-00:00")) or "+" in iso[-6:] or "-" in iso[-6:] else ""
+                if display_start_time.tzinfo is not None:
+                    offset = display_start_time.utcoffset()
+                    if offset is not None:
+                        total_minutes = int(offset.total_seconds() // 60)
+                        sign = "+" if total_minutes >= 0 else "-"
+                        total_minutes = abs(total_minutes)
+                        response_tz = f"{sign}{total_minutes // 60:02d}:{total_minutes % 60:02d}"
             except Exception:
                 response_tz = ""
 
