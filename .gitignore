@@ -46,3 +46,7 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+
+# Runtime data stores (memory, aliases, embeddings)
+data/memory/
+data/embeddings/

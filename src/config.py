@@ -138,6 +138,14 @@ class Settings(BaseSettings):
             "which is per-user and shared with Outlook/OWA."
         ),
     )
+    ews_id_aliases_enabled: bool = Field(
+        default=True,
+        description=(
+            "Attach short ids (sid: m12, e3, ...) next to long EWS ids in "
+            "tool outputs and accept them in id params. Additive — raw ids "
+            "keep working everywhere."
+        ),
+    )
 
     # Rate limiting
     rate_limit_enabled: bool = True

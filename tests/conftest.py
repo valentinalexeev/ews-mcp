@@ -7,6 +7,21 @@ from datetime import datetime
 from src.config import Settings
 from src.auth import AuthHandler
 from src.ews_client import EWSClient
+from src.id_alias import reset_aliaser_cache
+
+
+@pytest.fixture(autouse=True)
+def _isolate_id_alias_store(tmp_path, monkeypatch):
+    """Keep the central id-alias SQLite store out of the repo during tests.
+
+    BaseTool.safe_execute engages the aliaser for every tool call; without
+    this, unit tests would mint data/memory/aliases.db in the working tree
+    and leak aliases across tests.
+    """
+    monkeypatch.setenv("EWS_MEMORY_DIR", str(tmp_path / "memory"))
+    reset_aliaser_cache()
+    yield
+    reset_aliaser_cache()
 
 
 @pytest.fixture

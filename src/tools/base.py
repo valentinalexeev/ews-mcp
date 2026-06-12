@@ -1,6 +1,7 @@
 """Base class for all MCP tools."""
 
 import asyncio
+import os
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -12,9 +13,85 @@ import time
 
 from ..ews_client import EWSClient
 from ..exceptions import ValidationError, ToolExecutionError
+from ..id_alias import get_aliaser, kind_for_key
 from ..utils import format_error_response
 from ..logging_system import get_logger
 from ..middleware.circuit_breaker import get_circuit_breaker
+
+# ---------------------------------------------------------------------------
+# Central id aliasing (token economy + move-stability)
+#
+# Raw EWS ItemIds are ~100-150 case-sensitive chars and change when an item
+# moves folders. The dispatcher below (a) accepts short aliases anywhere a
+# tool takes an id, (b) attaches a short ``sid`` next to every long id it
+# ships out, (c) rebinds aliases when move responses report id remaps. Raw
+# ids keep flowing unchanged — aliasing is strictly additive.
+# ---------------------------------------------------------------------------
+
+# Long EWS ids comfortably exceed this; UUIDs and friends stay untouched.
+_ALIAS_MIN_ID_LEN = 40
+_PRIMARY_ID_KEYS = frozenset({
+    "message_id", "draft_id", "event_id", "item_id", "appointment_id",
+    "task_id", "contact_id", "email_id",
+})
+_THREAD_ID_KEYS = frozenset({"conversation_id", "thread_id"})
+_ID_LIST_KEYS = frozenset({"ids", "message_ids"})
+
+
+def _resolve_alias_inputs(aliaser, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate alias-shaped id params back to raw EWS ids. Raises KeyError
+    (from ``IdAliaser.resolve``) for stale/unknown aliases."""
+    out = dict(kwargs)
+    for key, value in kwargs.items():
+        if (key in _PRIMARY_ID_KEYS or key in _THREAD_ID_KEYS) and isinstance(value, str):
+            out[key] = aliaser.resolve(value)
+        elif key in _ID_LIST_KEYS and isinstance(value, list):
+            out[key] = [
+                aliaser.resolve(v) if isinstance(v, str) else v for v in value
+            ]
+    return out
+
+
+def _alias_outputs(aliaser, node: Any) -> Any:
+    """Walk a result structure, attaching ``sid`` next to long ids (in
+    place) and rebinding aliases on move remaps ({old_id, new_id})."""
+    if isinstance(node, dict):
+        old_id, new_id = node.get("old_id"), node.get("new_id")
+        if (
+            isinstance(old_id, str) and isinstance(new_id, str)
+            and len(new_id) >= _ALIAS_MIN_ID_LEN
+        ):
+            alias = aliaser.rebind(old_id, new_id)
+            if alias:
+                node.setdefault("sid", alias)
+        imid = node.get("internet_message_id")
+        if not isinstance(imid, str):
+            imid = None
+        for key in list(node.keys()):
+            value = node[key]
+            if isinstance(value, (dict, list)):
+                _alias_outputs(aliaser, value)
+            elif (
+                key in _PRIMARY_ID_KEYS
+                and isinstance(value, str)
+                and len(value) >= _ALIAS_MIN_ID_LEN
+            ):
+                node.setdefault(
+                    "sid",
+                    aliaser.alias_for(
+                        value, kind_for_key(key), internet_message_id=imid
+                    ),
+                )
+            elif (
+                key in _THREAD_ID_KEYS
+                and isinstance(value, str)
+                and len(value) >= _ALIAS_MIN_ID_LEN
+            ):
+                node.setdefault("thread_sid", aliaser.alias_for(value, "t"))
+    elif isinstance(node, list):
+        for item in node:
+            _alias_outputs(aliaser, item)
+    return node
 
 # Dedicated bounded executor for EWS-touching tool bodies. exchangelib is
 # synchronous: running it inline in async handlers froze the whole event
@@ -95,6 +172,20 @@ class BaseTool(ABC):
             return target_mailbox
         return self.ews_client.config.ews_email
 
+    def _get_aliaser(self):
+        """Process-wide id aliaser, or None when disabled/unavailable.
+
+        Aliasing must never take a tool call down — any setup failure
+        degrades to raw-id passthrough.
+        """
+        if not bool(getattr(self.ews_client.config, "ews_id_aliases_enabled", True)):
+            return None
+        try:
+            return get_aliaser(os.environ.get("EWS_MEMORY_DIR", "data/memory"))
+        except Exception as exc:
+            self.logger.debug(f"id aliaser unavailable: {exc}")
+            return None
+
     def get_memory_store(self):
         """Return the persistent memory store for the primary authenticated mailbox.
 
@@ -164,6 +255,21 @@ class BaseTool(ABC):
             self._log_error("SendDisabled", tool_name, module_name, kwargs, err, duration_ms)
             return format_error_response(err, "")
 
+        # Alias resolution: accept short ids (m12, e3, ...) anywhere a
+        # tool takes an id. A stale alias is a clean user error with a
+        # re-search hint, not a 500.
+        aliaser = self._get_aliaser()
+        if aliaser is not None:
+            try:
+                kwargs = _resolve_alias_inputs(aliaser, kwargs)
+            except KeyError as e:
+                duration_ms = int((time.time() - start_time) * 1000)
+                err = ValidationError(e.args[0] if e.args else str(e))
+                self._log_error(
+                    "StaleAlias", tool_name, module_name, kwargs, err, duration_ms
+                )
+                return format_error_response(err, "")
+
         # Log attempt
         self.log_manager.log_activity(
             level="INFO",
@@ -177,6 +283,14 @@ class BaseTool(ABC):
         try:
             result = await self._run_execute(**kwargs)
             duration_ms = int((time.time() - start_time) * 1000)
+
+            # Attach short aliases next to long EWS ids (additive; never
+            # allowed to break a successful response).
+            if aliaser is not None and isinstance(result, dict):
+                try:
+                    _alias_outputs(aliaser, result)
+                except Exception as alias_exc:
+                    self.logger.warning(f"id aliasing skipped: {alias_exc}")
 
             # Record success with circuit breaker
             cb.record_success()
