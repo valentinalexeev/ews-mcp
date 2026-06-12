@@ -1,7 +1,7 @@
 """Exchange Web Services client wrapper."""
 
 from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION, EWSTimeZone
-from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+from exchangelib.protocol import BaseProtocol, FaultTolerance, NoVerifyHTTPAdapter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 import logging
 from typing import Optional, Dict
@@ -119,10 +119,17 @@ class EWSClient:
                 # answers 401 with multiple WWW-Authenticate schemes only
                 # authenticates via exchangelib's auto-negotiation — forcing
                 # BASIC or NTLM yields "Invalid credentials" (verified live).
+                # FaultTolerance makes exchangelib honor ErrorServerBusy
+                # back-off delays and retry transient 503/connection errors
+                # per request. retry_policy=None previously disabled ALL
+                # request-level resilience — the tenacity decorator only
+                # covers account *creation*, not the 73 tools' EWS calls.
                 config = Configuration(
                     service_endpoint=ews_url,
                     credentials=credentials,
-                    retry_policy=None,  # Disable built-in retry, we handle it
+                    retry_policy=FaultTolerance(
+                        max_wait=self.config.ews_retry_max_wait_seconds
+                    ),
                     max_connections=self.config.connection_pool_size
                 )
 
@@ -253,7 +260,9 @@ class EWSClient:
                 config = Configuration(
                     service_endpoint=self._get_ews_url(),
                     credentials=credentials,
-                    retry_policy=None,
+                    retry_policy=FaultTolerance(
+                        max_wait=self.config.ews_retry_max_wait_seconds
+                    ),
                     max_connections=self.config.connection_pool_size
                 )
 

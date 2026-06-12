@@ -114,6 +114,14 @@ class Settings(BaseSettings):
         default=600,
         description="Interval for the warm-connection liveness probe; 0 disables.",
     )
+    ews_retry_max_wait_seconds: int = Field(
+        default=300,
+        description=(
+            "exchangelib FaultTolerance budget: total seconds it may spend "
+            "retrying a single request through ErrorServerBusy back-offs and "
+            "transient 503s before raising."
+        ),
+    )
 
     # Rate limiting
     rate_limit_enabled: bool = True

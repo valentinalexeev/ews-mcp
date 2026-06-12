@@ -229,6 +229,8 @@ _KWARG_CONTRACTS = [
     ("exchangelib.Message.send", "save_copy", "present"),
     ("exchangelib.Account.fetch", "ids", "present"),
     ("exchangelib.CalendarItem.save", "send_meeting_invitations", "present"),
+    # ews_client.py builds the per-request retry policy with max_wait.
+    ("exchangelib.protocol.FaultTolerance", "max_wait", "present"),
 ]
 
 
