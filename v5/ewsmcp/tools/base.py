@@ -1,4 +1,4 @@
-"""ToolSpec + the dispatcher: every gate from IDEATION §7-8 in one chain.
+"""ToolSpec + the dispatcher: every gate from DESIGN.md §Safety in one chain.
 
 Gate order (policy before connectivity, nothing irreversible without two
 model decisions): kill-switch → tier → circuit → cold gate → recipient

@@ -1,4 +1,4 @@
-"""HTTP serving: Streamable HTTP /mcp + REST shim + health (IDEATION §4)."""
+"""HTTP serving: Streamable HTTP /mcp + REST shim + health (DESIGN.md §Transports)."""
 
 import hmac
 import json

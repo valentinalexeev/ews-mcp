@@ -1,4 +1,4 @@
-"""Token-lean DTO builders (IDEATION §6). The model never sees a raw EWS id:
+"""Token-lean DTO builders (DESIGN.md §DTOs). The model never sees a raw EWS id:
 ``id`` IS the short alias; the aliaser holds the raw id + changekey."""
 
 from datetime import datetime

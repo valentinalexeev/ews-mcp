@@ -1,4 +1,4 @@
-"""Tool pack: mail_read — the six read-class tools of IDEATION §5 (1-6).
+"""Tool pack: mail_read — the read-class mail tools of DESIGN.md §Tools.
 
 Handlers receive RAW EWS ids (the dispatcher already resolved m##/t##
 aliases on the way in) and emit DTOs whose ids are short aliases. No

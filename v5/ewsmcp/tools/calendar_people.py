@@ -1,4 +1,4 @@
-"""Tool pack: calendar + people + status — IDEATION §5 tools 7-12.
+"""Tool pack: calendar + people + status — DESIGN.md §Tools (calendar/people).
 
 Six read-class tools: list_events, get_event, check_availability,
 find_people, get_oof_settings, get_server_status. Handlers receive RAW

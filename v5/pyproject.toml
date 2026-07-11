@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ews-mcp-v5"
-version = "5.0.0a1"
-description = "Greenfield EWS MCP server — 24 consolidated tools for an executive-mailbox agent-secretary (design/ews-mcp-fable-redo/IDEATION.md)"
+name = "ews-mcp"
+version = "4.5.0a1"
+description = "EWS MCP server — a lean, safety-gated, cache-first tool surface for an executive-mailbox assistant (see DESIGN.md)"
 requires-python = ">=3.11"
 dependencies = [
     "exchangelib==5.0.3",

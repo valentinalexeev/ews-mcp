@@ -1,4 +1,4 @@
-"""Hash-chained append-only audit log (IDEATION §9).
+"""Hash-chained append-only audit log (DESIGN.md §Audit).
 
 One JSONL record per tool call; ``hash = sha256(prev_hash | canonical)``.
 Bodies never land here; recipients/subject do for send-class ops only.

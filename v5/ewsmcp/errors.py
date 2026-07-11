@@ -1,5 +1,5 @@
 """Error taxonomy — every failure the model sees is one of these codes,
-with a hint written for the model, never a traceback (IDEATION §7)."""
+with a hint written for the model, never a traceback (DESIGN.md §Errors)."""
 
 from typing import Any, Dict, Optional
 
