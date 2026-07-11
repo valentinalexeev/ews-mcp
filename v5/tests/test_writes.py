@@ -139,8 +139,12 @@ def test_pack_surface_classes_and_confirm_declarations():
     for name in ("create_draft", "update_draft", "delete_draft",
                  "update_messages", "move_messages"):
         assert SPEC[name].confirm is False
-    for name in ("send_draft", "respond_to_event", "cancel_event", "set_oof"):
+    for name in ("respond_to_event", "cancel_event", "set_oof"):
         assert SPEC[name].confirm is True
+    # send_draft: confirm-gated with a CONTENT-BOUND preview hook; the gate
+    # is skipped only for an idempotent replay of an already-sent draft.
+    assert SPEC["send_draft"].confirm({"draft_id": "d1"}) is True
+    assert SPEC["send_draft"].preview is not None
     assert SPEC["create_event"].confirm({"send_invitations": True}) is True
     assert SPEC["create_event"].confirm({}) is False
     assert SPEC["update_event"].confirm({"notify_attendees": True}) is True
@@ -353,6 +357,124 @@ def test_send_draft_tier_blocked_on_draft_tier(tmp_path):
                    send_enabled=True, ews_capability_tier="draft")
     res = call(ctx, "send_draft", {"draft_id": "RAW-D5"})
     assert res["error"]["code"] == "tier_blocked"
+
+
+# --- send_draft: content binding (the v3.5 port; TOCTOU + resolved guards) ------
+
+
+def make_content_draft(subject="Q3 numbers", to=("board@corp.example",),
+                       body="please review before Sunday"):
+    draft = MagicMock()
+    draft.parent_folder_id = SimpleNamespace(id=DRAFTS_ID)
+    draft.message_id = "<imid-2@corp.example>"
+    draft.subject = subject
+    draft.to_recipients = [SimpleNamespace(email_address=a) for a in to]
+    draft.cc_recipients = []
+    draft.bcc_recipients = []
+    draft.text_body = body
+    draft.attachments = []
+    draft.send.return_value = None
+    return draft
+
+
+def test_send_draft_phase1_previews_the_drafts_real_content(tmp_path):
+    account = make_account()
+    ctx = full_ctx(tmp_path, account)
+    account._by_id["RAW-D7"] = make_content_draft(
+        to=("board@corp.example", "cfo@external.example"))
+    p1 = call(ctx, "send_draft", {"draft_id": "RAW-D7"})
+    assert p1["requires_confirmation"] is True
+    assert p1["preview"]["subject"] == "Q3 numbers"
+    assert p1["preview"]["to"] == ["board@corp.example", "cfo@external.example"]
+    assert p1["preview"]["body_snippet"].startswith("please review")
+    assert p1["preview"]["attachment_count"] == 0
+    assert any("cfo@external.example" in w for w in p1["warnings"])
+
+
+def test_send_draft_toctou_edit_invalidates_token(tmp_path):
+    """update_draft between preview and confirm must kill the token —
+    the exact redirect attack the old draft_id-only hash allowed."""
+    account = make_account()
+    ctx = full_ctx(tmp_path, account)
+    draft = make_content_draft()
+    account._by_id["RAW-D8"] = draft
+    token = call(ctx, "send_draft", {"draft_id": "RAW-D8"})["confirm_token"]
+    draft.to_recipients = [SimpleNamespace(email_address="attacker@evil.example")]
+    p2 = call(ctx, "send_draft", {"draft_id": "RAW-D8", "confirm_token": token})
+    assert p2["error"]["code"] == "confirm_invalid"
+    assert "stale" in p2["error"]["message"]
+    draft.send.assert_not_called()
+
+
+def test_send_draft_body_edit_also_invalidates_token(tmp_path):
+    account = make_account()
+    ctx = full_ctx(tmp_path, account)
+    draft = make_content_draft()
+    account._by_id["RAW-D9"] = draft
+    token = call(ctx, "send_draft", {"draft_id": "RAW-D9"})["confirm_token"]
+    draft.text_body = "wire the funds to the new account"
+    p2 = call(ctx, "send_draft", {"draft_id": "RAW-D9", "confirm_token": token})
+    assert p2["error"]["code"] == "confirm_invalid"
+    draft.send.assert_not_called()
+
+
+def test_send_draft_guard_blocks_denylisted_draft_recipient(tmp_path):
+    """kwargs carry no recipients — the guard must fire on the DRAFT's."""
+    account = make_account()
+    ctx = full_ctx(tmp_path, account,
+                   ews_recipient_denylist="*@competitor.example")
+    account._by_id["RAW-DA"] = make_content_draft(to=("ceo@competitor.example",))
+    p1 = call(ctx, "send_draft", {"draft_id": "RAW-DA"})
+    assert p1["error"]["code"] == "recipient_blocked"
+    assert "confirm_token" not in p1
+
+
+def test_send_draft_allowlist_enforced_on_resolved_recipients(tmp_path):
+    account = make_account()
+    ctx = full_ctx(tmp_path, account,
+                   ews_recipient_allowlist="*@corp.example")
+    account._by_id["RAW-DB"] = make_content_draft(to=("out@other.example",))
+    p1 = call(ctx, "send_draft", {"draft_id": "RAW-DB"})
+    assert p1["error"]["code"] == "recipient_blocked"
+
+
+def test_send_draft_token_single_use_without_idempotency_key(tmp_path):
+    account = make_account()
+    ctx = full_ctx(tmp_path, account)
+    draft = make_content_draft()
+    account._by_id["RAW-DC"] = draft
+    token = call(ctx, "send_draft", {"draft_id": "RAW-DC"})["confirm_token"]
+    first = call(ctx, "send_draft", {"draft_id": "RAW-DC", "confirm_token": token})
+    assert first["sent"] is True
+    again = call(ctx, "send_draft", {"draft_id": "RAW-DC", "confirm_token": token})
+    assert again["error"]["code"] == "confirm_invalid"
+    assert "consumed" in again["error"]["message"]
+    assert draft.send.call_count == 1
+
+
+def test_idempotency_store_ttl_and_cap(monkeypatch):
+    writes.reset_idempotency_store()
+    writes._idempotency_put("old", {"draft_id": "d", "result": {}, "ts": 0.0})
+    assert writes._idempotency_get("old") is None  # expired entries pruned
+    monkeypatch.setattr(writes, "_IDEMPOTENCY_MAX", 2)
+    now = __import__("time").time()
+    writes._idempotency_put("k1", {"draft_id": "a", "result": {}, "ts": now - 30})
+    writes._idempotency_put("k2", {"draft_id": "b", "result": {}, "ts": now - 20})
+    writes._idempotency_put("k3", {"draft_id": "c", "result": {}, "ts": now - 10})
+    assert writes._idempotency_get("k1") is None  # oldest evicted at the cap
+    assert writes._idempotency_get("k2") is not None
+    assert writes._idempotency_get("k3") is not None
+
+
+def test_create_draft_recipients_are_guarded(tmp_path, monkeypatch):
+    """Write-class argument-borne recipients hit the guard (old dead code)."""
+    account = make_account()
+    ctx = make_ctx(tmp_path, account,
+                   ews_recipient_denylist="*@competitor.example")
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    res = call(ctx, "create_draft",
+               {"to": ["ceo@competitor.example"], "body": "hi"})
+    assert res["error"]["code"] == "recipient_blocked"
 
 
 # --- create_event / update_event ------------------------------------------------

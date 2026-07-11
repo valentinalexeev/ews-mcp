@@ -32,6 +32,7 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
 
 import html as _html
 import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -56,14 +57,35 @@ _OOF_STATE = {
 }
 
 # --- send_draft idempotency (IDEATION §8.4, Stripe semantics) ---------------
+# Bounded: entries expire after 48h and the store caps at 512 keys (oldest
+# evicted first) so a long-lived process can't grow it without limit.
 _IDEMPOTENT_SENDS: Dict[str, Dict[str, Any]] = {}
 _IDEMPOTENT_LOCK = threading.Lock()
+_IDEMPOTENCY_TTL_S = 48 * 3600
+_IDEMPOTENCY_MAX = 512
 
 
 def reset_idempotency_store() -> None:
     """Tests only."""
     with _IDEMPOTENT_LOCK:
         _IDEMPOTENT_SENDS.clear()
+
+
+def _idempotency_get(key: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _IDEMPOTENT_LOCK:
+        for stale in [k for k, v in _IDEMPOTENT_SENDS.items()
+                      if now - v.get("ts", 0) > _IDEMPOTENCY_TTL_S]:
+            del _IDEMPOTENT_SENDS[stale]
+        return _IDEMPOTENT_SENDS.get(key)
+
+
+def _idempotency_put(key: str, record: Dict[str, Any]) -> None:
+    with _IDEMPOTENT_LOCK:
+        while len(_IDEMPOTENT_SENDS) >= _IDEMPOTENCY_MAX:
+            oldest = min(_IDEMPOTENT_SENDS, key=lambda k: _IDEMPOTENT_SENDS[k].get("ts", 0))
+            del _IDEMPOTENT_SENDS[oldest]
+        _IDEMPOTENT_SENDS[key] = record
 
 
 # --- shared helpers ----------------------------------------------------------
@@ -340,6 +362,8 @@ async def _move_messages(ctx: Context, *, ids: List[str],
                 if isinstance(item, Exception):
                     raise item
                 item.move(folder)  # returns None; updates item.id in place (5.0.3)
+                # 5.0.3 may leave item.id None when the response carries no
+                # new id — never crash on it; fall back to the old binding.
                 new_raw = str(item.id) if getattr(item, "id", None) else None
                 alias = None
                 if new_raw and new_raw != raw_id:
@@ -348,7 +372,11 @@ async def _move_messages(ctx: Context, *, ids: List[str],
                     alias = ctx.aliaser.rebind(raw_id, new_raw)
                 if alias is None:
                     alias = ctx.aliaser.alias_for(new_raw or raw_id, "m")
-                moved.append({"id": alias})
+                row: Dict[str, Any] = {"id": alias}
+                if new_raw is None:
+                    row["note"] = ("moved, but Exchange returned no new id — "
+                                   "re-search before reusing this id")
+                moved.append(row)
             except Exception as exc:
                 failed.append(_failed_entry(ctx, raw_id, exc))
         return {"moved": len(moved), "items": moved, "failed": failed}
@@ -442,11 +470,73 @@ async def _update_event(ctx: Context, *, event_id: str,
 # --- SEND class (leaves the mailbox; tier full, two-phase, kill-switch) ------
 
 
+def _draft_content(msg: Any) -> Dict[str, Any]:
+    """The draft fields the confirm token binds and the preview shows.
+
+    Recipients are sorted so reordering doesn't invalidate a token, but
+    adding/removing one does (a content change worth re-previewing).
+    """
+    subject = getattr(msg, "subject", None)
+    body_text = getattr(msg, "text_body", None)
+    if not isinstance(body_text, str):
+        body = getattr(msg, "body", None)
+        body_text = str(body) if body is not None else ""
+    return {
+        "subject": subject if isinstance(subject, str) else "",
+        "to": sorted(_email_list(getattr(msg, "to_recipients", None))),
+        "cc": sorted(_email_list(getattr(msg, "cc_recipients", None))),
+        "bcc": sorted(_email_list(getattr(msg, "bcc_recipients", None))),
+        "body_text": body_text,
+        "attachment_count": len(getattr(msg, "attachments", None) or []),
+    }
+
+
+async def _send_draft_preview(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Confirm-gate hook: fetch the draft's CURRENT content (both phases).
+
+    Phase 1 hashes it into the token and shows it as the preview; phase 2
+    refetches and the hash mismatch kills the token if the draft changed in
+    between (update_draft TOCTOU) — ported from the v3.5 implementation.
+    """
+    draft_id = kwargs.get("draft_id")
+    if not isinstance(draft_id, str) or not draft_id:
+        raise ToolError("validation", "draft_id is required")
+    try:
+        raw_id = ctx.aliaser.resolve(draft_id)
+    except KeyError as e:
+        raise ToolError("validation", str(e.args[0] if e.args else e))
+
+    def work(account: Any) -> Dict[str, Any]:
+        msg = _fetch_one(account, raw_id)
+        _require_in_drafts(msg, account, "send_draft")
+        return _draft_content(msg)
+
+    content = await ctx.gateway.call(work)
+    content["draft_id"] = draft_id  # echo the caller's handle in the preview
+    return content
+
+
+def _send_confirm_needed(kwargs: Dict[str, Any]) -> bool:
+    """Skip the confirm gate on an idempotent REPLAY (v3.5 semantics).
+
+    A retry with the same idempotency_key + draft_id returns the cached
+    receipt without sending anything, so demanding a fresh (single-use)
+    token there would break exactly the retry-after-timeout case the key
+    exists for. A mismatched draft_id still goes through the gate and is
+    rejected by the handler.
+    """
+    key = kwargs.get("idempotency_key")
+    if isinstance(key, str) and key:
+        prior = _idempotency_get(key)
+        if prior is not None and prior.get("draft_id") == kwargs.get("draft_id"):
+            return False
+    return True
+
+
 async def _send_draft(ctx: Context, *, draft_id: str,
                       idempotency_key: Optional[str] = None) -> Dict[str, Any]:
     if idempotency_key:
-        with _IDEMPOTENT_LOCK:
-            prior = _IDEMPOTENT_SENDS.get(idempotency_key)
+        prior = _idempotency_get(idempotency_key)
         if prior is not None:
             if prior["draft_id"] != draft_id:
                 raise ToolError(
@@ -467,9 +557,9 @@ async def _send_draft(ctx: Context, *, draft_id: str,
 
     result = await ctx.gateway.call(work)
     if idempotency_key:
-        with _IDEMPOTENT_LOCK:
-            _IDEMPOTENT_SENDS[idempotency_key] = {"draft_id": draft_id,
-                                                  "result": dict(result)}
+        _idempotency_put(idempotency_key, {"draft_id": draft_id,
+                                           "result": dict(result),
+                                           "ts": time.time()})
     return result
 
 
@@ -691,15 +781,19 @@ TOOLS: List[ToolSpec] = [
         name="send_draft",
         description=(
             "Send an existing draft (the ONLY way mail leaves this mailbox). "
-            "Two-phase: first call returns a preview + confirm_token, second "
-            "call with the token sends. Optional idempotency_key dedupes "
-            "retries (replays return the stored result)."
+            "Two-phase: the first call fetches the draft and returns its REAL "
+            "recipients/subject/body as a preview + confirm_token bound to "
+            "that content; the second call with the token re-verifies the "
+            "content and sends (editing the draft in between invalidates the "
+            "token). Optional idempotency_key dedupes retries (replays return "
+            "the stored result)."
         ),
         side_effect_class="send",
         input_schema=_obj({"draft_id": _STR, "idempotency_key": _STR},
                           required=["draft_id"]),
         handler=_send_draft,
-        confirm=True,
+        confirm=_send_confirm_needed,
+        preview=_send_draft_preview,
     ),
     ToolSpec(
         name="respond_to_event",

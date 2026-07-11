@@ -12,6 +12,12 @@ Stateless by design: nothing is persisted, so tokens survive process restarts
 only while the secret is stable. Set ``SEND_CONFIRM_SECRET`` to keep tokens
 valid across restarts; otherwise a per-process secret is used (fine given the
 10-minute default TTL).
+
+Single-use: a verified token must also be *consumed* exactly once
+(``consume_token``). The consumption record is in-process only — after a
+restart an unexpired token could in principle be replayed, which is why the
+TTL stays short and the record is a defense-in-depth layer on top of the
+content binding, not a substitute for it.
 """
 from __future__ import annotations
 
@@ -21,10 +27,44 @@ import hmac
 import json
 import os
 import secrets
+import threading
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_TTL_SECONDS = 600
+
+# sig -> expiry_ts of tokens already spent on a successful phase-2.
+_CONSUMED: Dict[str, float] = {}
+_CONSUMED_LOCK = threading.Lock()
+
+
+def consume_token(token: str) -> bool:
+    """Mark a (previously verified) token as spent.
+
+    Returns False when the token was already consumed. Expired records are
+    pruned opportunistically so the registry stays bounded by the TTL.
+    """
+    sig = token.rsplit(".", 1)[-1]
+    expiry = time.time() + DEFAULT_TTL_SECONDS
+    try:  # prefer the token's own expiry for the prune horizon
+        raw = base64.urlsafe_b64decode(token.rsplit(".", 1)[0].encode("ascii"))
+        expiry = float(json.loads(raw).get("e", expiry))
+    except Exception:
+        pass
+    now = time.time()
+    with _CONSUMED_LOCK:
+        for stale in [s for s, exp in _CONSUMED.items() if exp < now]:
+            del _CONSUMED[stale]
+        if sig in _CONSUMED:
+            return False
+        _CONSUMED[sig] = expiry
+    return True
+
+
+def reset_consumed_tokens() -> None:
+    """Tests only."""
+    with _CONSUMED_LOCK:
+        _CONSUMED.clear()
 
 # Per-process fallback secret when SEND_CONFIRM_SECRET is unset. Tokens then
 # do not survive a restart — acceptable given the short TTL.

@@ -14,7 +14,12 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from exchangelib import Account, Configuration, Credentials, DELEGATE, EWSTimeZone
-from exchangelib.protocol import BaseProtocol, FaultTolerance, NoVerifyHTTPAdapter
+from exchangelib.protocol import (
+    BaseProtocol,
+    CachingProtocol,
+    FaultTolerance,
+    NoVerifyHTTPAdapter,
+)
 
 from ..config import Settings
 from ..errors import ToolError
@@ -75,7 +80,14 @@ class EWSGateway:
         )
 
     def reset(self) -> None:
-        """Drop the cached account so the next access renegotiates fresh."""
+        """Drop the cached account AND exchangelib's protocol-cache entry.
+
+        Dropping only our Account is not enough: ``CachingProtocol`` hands
+        the same wedged Protocol (with its already-negotiated auth type)
+        right back on the next build, so a session that died mid-outage
+        would never renegotiate. Clearing the cache forces a genuinely
+        fresh session + auth negotiation on the next access.
+        """
         with self._account_lock:
             if self._account is not None:
                 try:
@@ -83,11 +95,23 @@ class EWSGateway:
                 except Exception:
                     pass
                 self._account = None
+        try:
+            CachingProtocol.clear_cache()
+        except Exception as e:
+            logger.debug("protocol cache clear failed: %s", e)
         self._folder_cache.clear()
+        self._folder_cache_ts = 0.0
 
     def test_connection(self) -> bool:
+        """Real network probe — must round-trip on EVERY call.
+
+        ``inbox.total_count`` is a cached property after its first read, so
+        probing it reported warm forever once it had succeeded once (the
+        false-warm bug: /readyz lied through outages and the reset ladder
+        never ran). ``root.refresh()`` issues a GetFolder request each time.
+        """
         try:
-            _ = self.account.inbox.total_count
+            self.account.root.refresh()
             self.last_connection_error = None
             return True
         except Exception as e:

@@ -2,6 +2,12 @@
 
 One JSONL record per tool call; ``hash = sha256(prev_hash | canonical)``.
 Bodies never land here; recipients/subject do for send-class ops only.
+
+The chain head (last hash + sequence number) persists in
+``audit/chain.state`` so the chain continues across restarts instead of
+silently restarting at GENESIS — without that, deleting a whole day's
+file was undetectable. ``scripts/verify_audit_chain.py`` walks the files
+and re-derives every link.
 """
 
 import hashlib
@@ -15,9 +21,16 @@ from typing import Any, Dict, Optional
 class AuditLog:
     def __init__(self, data_dir: str):
         self._dir = Path(data_dir) / "audit"
+        self._state_path = self._dir / "chain.state"
         self._lock = threading.Lock()
         self._prev = "GENESIS"
         self._seq = 0
+        try:  # resume the persisted chain head; a fresh dir starts at GENESIS
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+            self._prev = str(state["prev"])
+            self._seq = int(state["seq"])
+        except Exception:
+            pass
 
     def record(
         self,
@@ -51,6 +64,10 @@ class AuditLog:
                 path = self._dir / f"audit-{time.strftime('%Y%m%d')}.jsonl"
                 with path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
+                self._state_path.write_text(
+                    json.dumps({"prev": self._prev, "seq": self._seq}),
+                    encoding="utf-8",
+                )
         except Exception:
             # Auditing must never take a tool call down.
             pass

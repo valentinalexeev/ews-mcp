@@ -324,6 +324,32 @@ class IdAliaser:
         return {row["kind"]: row["c"] for row in rows}
 
 
+class NullAliaser:
+    """Pass-through stand-in used when the SQLite store cannot initialise.
+
+    Aliasing is sugar — a broken disk must degrade the server to raw EWS
+    ids, never kill the boot. ``resolve`` passes everything through (no
+    KeyError: without a store, alias-shaped strings can't be looked up,
+    and raw ids must keep working).
+    """
+
+    def alias_for(self, ews_id: str, kind: str = "m", changekey=None,
+                  internet_message_id=None) -> str:
+        return ews_id
+
+    def resolve(self, value: str) -> str:
+        return value
+
+    def rebind(self, old_ews_id: str, new_ews_id: str, changekey=None):
+        return None
+
+    def imid_for(self, alias_or_id: str):
+        return None
+
+    def stats(self) -> dict:
+        return {}
+
+
 # --- Module helpers --------------------------------------------------------
 
 # Process-wide singleton per resolved directory, so every tool shares one

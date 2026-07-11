@@ -10,7 +10,7 @@ from .audit import AuditLog
 from .config import Settings
 from .gateway.client import EWSGateway
 from .gateway.connection import ConnectionManager
-from .ids import get_aliaser
+from .ids import NullAliaser, get_aliaser
 from .tools import build_registry
 from .tools.base import Context, dispatch
 
@@ -28,14 +28,32 @@ ANNOTATIONS = {
 }
 
 
+class _NullAudit:
+    def record(self, *args, **kwargs) -> None:
+        return None
+
+
 def build_context(settings: Settings) -> Context:
     gateway = EWSGateway(settings)
+    # Aliaser/audit are quality-of-life layers — their storage failing
+    # (bad volume, permissions) degrades them to pass-through, never
+    # prevents boot: the never-exit contract covers local disks too.
+    try:
+        aliaser = get_aliaser(f"{settings.data_dir}/memory")
+    except Exception as exc:
+        logger.error("aliaser init failed (%s) — running with raw EWS ids", exc)
+        aliaser = NullAliaser()
+    try:
+        audit = AuditLog(settings.data_dir)
+    except Exception as exc:
+        logger.error("audit init failed (%s) — audit disabled", exc)
+        audit = _NullAudit()
     ctx = Context(
         settings=settings,
         gateway=gateway,
         manager=None,
-        aliaser=get_aliaser(f"{settings.data_dir}/memory"),
-        audit=AuditLog(settings.data_dir),
+        aliaser=aliaser,
+        audit=audit,
     )
     build_registry(ctx)
     return ctx

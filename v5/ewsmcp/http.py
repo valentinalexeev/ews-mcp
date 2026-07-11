@@ -3,8 +3,9 @@
 import hmac
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+import jsonschema
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__
@@ -15,6 +16,18 @@ from .tools.base import dispatch
 logger = logging.getLogger(__name__)
 
 PUBLIC_PATHS = {"/health", "/livez", "/readyz", "/version"}
+MAX_BODY_BYTES = 1_048_576  # 1 MiB — tool arguments, not attachments
+
+
+def _validator_for(spec) -> Any:
+    """Compiled validator for the tool's PUBLIC schema (which includes
+    confirm_token for two-phase tools), cached on the spec itself so it can
+    never go stale against a different spec of the same name."""
+    v = getattr(spec, "_rest_validator", None)
+    if v is None:
+        v = jsonschema.Draft202012Validator(spec.public_schema()["inputSchema"])
+        spec._rest_validator = v
+    return v
 
 
 def _authorized(headers, api_key: str) -> bool:
@@ -55,13 +68,40 @@ def _openapi(ctx) -> Dict[str, Any]:
             "paths": paths}
 
 
-async def serve_http(settings) -> None:
-    import uvicorn
+async def _read_json_body(receive, send) -> Optional[Any]:
+    """Drain the request body (bounded) and parse JSON.
 
-    ctx = build_context(settings)
-    mcp_server = build_mcp_server(ctx)
-    streamable = StreamableHTTPSessionManager(app=mcp_server, json_response=False,
-                                              stateless=True)
+    Returns the parsed value, or None after having already sent an error
+    response. A client disconnect mid-body returns None without sending
+    (the old loop hung forever waiting for more http.request messages).
+    """
+    chunks = []
+    size = 0
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return None
+        if message["type"] == "http.request":
+            body = message.get("body", b"")
+            size += len(body)
+            if size > MAX_BODY_BYTES:
+                await _send_json(send, 413, {"ok": False, "error": {
+                    "code": "validation",
+                    "message": f"request body exceeds {MAX_BODY_BYTES} bytes"}})
+                return None
+            chunks.append(body)
+            if not message.get("more_body"):
+                break
+    try:
+        return json.loads(b"".join(chunks) or b"{}")
+    except Exception as e:
+        await _send_json(send, 400, {"ok": False, "error": {
+            "code": "validation", "message": f"invalid JSON body: {e}"}})
+        return None
+
+
+def build_app(ctx, settings, streamable: Optional[Any] = None):
+    """ASGI app closure — separated from serve_http so tests can drive it."""
     api_key = settings.mcp_api_key or ""
 
     async def app(scope, receive, send):
@@ -97,6 +137,10 @@ async def serve_http(settings) -> None:
                 "code": "auth_failed", "message": "missing or invalid bearer token"}})
 
         if path == "/mcp":
+            if streamable is None:
+                return await _send_json(send, 503, {"ok": False, "error": {
+                    "code": "upstream_unavailable",
+                    "message": "MCP transport not mounted"}})
             return await streamable.handle_request(scope, receive, send)
         if path == "/openapi.json" and method == "GET":
             return await _send_json(send, 200, _openapi(ctx))
@@ -112,18 +156,19 @@ async def serve_http(settings) -> None:
             if spec is None:
                 return await _send_json(send, 404, {"ok": False, "error": {
                     "code": "validation", "message": f"Unknown tool: {name}"}})
-            chunks = []
-            while True:
-                message = await receive()
-                if message["type"] == "http.request":
-                    chunks.append(message.get("body", b""))
-                    if not message.get("more_body"):
-                        break
-            try:
-                arguments = json.loads(b"".join(chunks) or b"{}")
-            except Exception as e:
+            arguments = await _read_json_body(receive, send)
+            if arguments is None:
+                return
+            if not isinstance(arguments, dict):
                 return await _send_json(send, 400, {"ok": False, "error": {
-                    "code": "validation", "message": f"invalid JSON body: {e}"}})
+                    "code": "validation",
+                    "message": "request body must be a JSON object of tool arguments"}})
+            error = jsonschema.exceptions.best_match(
+                _validator_for(spec).iter_errors(arguments))
+            if error is not None:
+                return await _send_json(send, 400, {"ok": False, "error": {
+                    "code": "validation", "message": error.message,
+                    "hint": f"See the {name} schema in /openapi.json."}})
             result = await dispatch(ctx, spec, arguments, transport="rest")
             status = 200
             if isinstance(result, dict) and result.get("ok") is False:
@@ -133,6 +178,17 @@ async def serve_http(settings) -> None:
         return await _send_json(send, 404, {"ok": False, "error": {
             "code": "validation", "message": "not found"}})
 
+    return app
+
+
+async def serve_http(settings) -> None:
+    import uvicorn
+
+    ctx = build_context(settings)
+    mcp_server = build_mcp_server(ctx)
+    streamable = StreamableHTTPSessionManager(app=mcp_server, json_response=False,
+                                              stateless=True)
+    app = build_app(ctx, settings, streamable)
     config = uvicorn.Config(app, host=settings.mcp_host, port=settings.mcp_port,
                             log_level=settings.log_level.lower(), http="h11")
     async with streamable.run():

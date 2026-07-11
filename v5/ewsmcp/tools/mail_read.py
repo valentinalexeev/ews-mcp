@@ -262,18 +262,22 @@ async def _get_thread(ctx: Context, id: str, limit: int = 20) -> Dict[str, Any]:
 
     def work(account: Any) -> Tuple[Any, str, List[Any]]:
         seed = _fetch_one(account, raw_id)
-        conv_id = getattr(getattr(seed, "conversation_id", None), "id", None)
+        conv_obj = getattr(seed, "conversation_id", None)
+        conv_id = getattr(conv_obj, "id", None)
         if not conv_id:
             raise ToolError(
                 "not_found",
                 "That message carries no conversation id; cannot rebuild a thread.",
                 hint="Use get_message on it instead.",
             )
-        # 5.0.3: filter wants the conversation id STRING (the object raises).
+        # 5.0.3: filter needs the ConversationId OBJECT — a plain string
+        # raises TypeError inside Q(). The seed item's own conversation_id
+        # is exactly that object; the string form is only used for the
+        # thread alias. (Behavior pinned in test_exchangelib_signatures.)
         conv_str = str(conv_id)
         merged: Dict[str, Any] = {}
         for source in (account.inbox, account.sent):
-            qs = _project(source.filter(conversation_id=conv_str), order=None)
+            qs = _project(source.filter(conversation_id=conv_obj), order=None)
             for it in qs:
                 key = str(getattr(it, "id", "") or "")
                 if key:

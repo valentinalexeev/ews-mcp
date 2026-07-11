@@ -195,6 +195,125 @@ def test_circuit_opens_after_threshold(tmp_path):
     assert "circuit open" in result["error"]["message"]
 
 
+# --- confirm_token hygiene, single-use, preview-hook binding (Phase B) --------
+
+
+def test_confirm_token_never_reaches_non_confirm_handlers(tmp_path):
+    """A stray confirm_token used to leak into handlers → TypeError → 502."""
+    ctx = _ctx(tmp_path)
+    result = asyncio.run(dispatch(ctx, _spec(_ok_handler),
+                                  {"confirm_token": "junk"}))
+    assert result.get("ran") is True
+    assert result["got"] == {}
+
+
+def test_handler_typeerror_maps_to_validation(tmp_path):
+    async def strict(ctx, *, required_arg):  # noqa: ARG001
+        return {"ran": True}
+
+    ctx = _ctx(tmp_path)
+    result = asyncio.run(dispatch(ctx, _spec(strict), {"wrong_name": 1}))
+    assert result["ok"] is False
+    assert result["error"]["code"] == "validation"
+    assert "schema" in result["error"]["hint"]
+
+
+def test_confirm_token_is_single_use(tmp_path):
+    ctx = _ctx(tmp_path, send_enabled=True, ews_capability_tier="full")
+    spec = _spec(_ok_handler, cls="send", confirm=True)
+    args = {"to": ["a@b.c"]}
+    token = asyncio.run(dispatch(ctx, spec, dict(args)))["confirm_token"]
+    first = asyncio.run(dispatch(ctx, spec, {**args, "confirm_token": token}))
+    assert first.get("ran") is True
+    replay = asyncio.run(dispatch(ctx, spec, {**args, "confirm_token": token}))
+    assert replay["error"]["code"] == "confirm_invalid"
+    assert "consumed" in replay["error"]["message"]
+
+
+def test_recipient_guard_fires_on_write_class(tmp_path):
+    """The old guard only covered class 'send' — dead code, since no
+    send-class tool carries recipient kwargs. Drafts/events are where
+    recipients actually enter."""
+    ctx = _ctx(tmp_path, ews_capability_tier="full",
+               ews_recipient_denylist="*@competitor.example")
+    result = asyncio.run(dispatch(ctx, _spec(_ok_handler, cls="write"),
+                                  {"to": ["ceo@competitor.example"], "body": "x"}))
+    assert result["error"]["code"] == "recipient_blocked"
+
+
+def test_allowlist_guard_on_write_class(tmp_path):
+    ctx = _ctx(tmp_path, ews_capability_tier="full",
+               ews_recipient_allowlist="*@corp.example")
+    blocked = asyncio.run(dispatch(ctx, _spec(_ok_handler, cls="write"),
+                                   {"to": ["out@other.example"]}))
+    assert blocked["error"]["code"] == "recipient_blocked"
+    ok = asyncio.run(dispatch(ctx, _spec(_ok_handler, cls="write"),
+                              {"to": ["peer@corp.example"]}))
+    assert ok.get("ran") is True
+
+
+def _preview_spec(handler, contents: list, **kw):
+    """Spec whose preview hook pops resolved content off `contents`."""
+    async def preview(ctx, kwargs):
+        return dict(contents.pop(0))
+
+    return ToolSpec(
+        name="t", description="test", side_effect_class=kw.get("cls", "send"),
+        input_schema={"type": "object", "properties": {}},
+        handler=handler, confirm=True, preview=preview,
+    )
+
+
+def test_preview_hook_phase1_shows_resolved_content(tmp_path):
+    ctx = _ctx(tmp_path, send_enabled=True, ews_capability_tier="full")
+    content = {"subject": "Q3", "to": ["x@external.example"], "cc": [],
+               "bcc": [], "body_text": "b" * 2000, "attachment_count": 1}
+    spec = _preview_spec(_ok_handler, [content])
+    p1 = asyncio.run(dispatch(ctx, spec, {"draft_id": "RAW-1"}))
+    assert p1["requires_confirmation"] is True
+    assert p1["preview"]["subject"] == "Q3"
+    assert p1["preview"]["to"] == ["x@external.example"]
+    assert len(p1["preview"]["body_snippet"]) == 1000
+    assert "body_text" not in p1["preview"]
+    assert any("external" in w for w in p1["warnings"])
+
+
+def test_preview_hook_content_change_kills_token(tmp_path):
+    """The TOCTOU defense: content edited between preview and confirm."""
+    ctx = _ctx(tmp_path, send_enabled=True, ews_capability_tier="full")
+    original = {"subject": "Q3", "to": ["a@corp.example"], "body_text": "safe"}
+    tampered = {"subject": "Q3", "to": ["attacker@evil.example"], "body_text": "safe"}
+    spec = _preview_spec(_ok_handler, [original, tampered])
+    token = asyncio.run(dispatch(ctx, spec, {"draft_id": "RAW-1"}))["confirm_token"]
+    p2 = asyncio.run(dispatch(ctx, spec, {"draft_id": "RAW-1",
+                                          "confirm_token": token}))
+    assert p2["error"]["code"] == "confirm_invalid"
+    assert "stale" in p2["error"]["message"]
+    assert "content changed" in p2["error"]["hint"]
+
+
+def test_preview_hook_unchanged_content_executes(tmp_path):
+    ctx = _ctx(tmp_path, send_enabled=True, ews_capability_tier="full")
+    content = {"subject": "Q3", "to": ["a@corp.example"], "body_text": "safe"}
+    spec = _preview_spec(_ok_handler, [dict(content), dict(content)])
+    token = asyncio.run(dispatch(ctx, spec, {"draft_id": "RAW-1"}))["confirm_token"]
+    p2 = asyncio.run(dispatch(ctx, spec, {"draft_id": "RAW-1",
+                                          "confirm_token": token}))
+    assert p2.get("ran") is True
+
+
+def test_preview_hook_resolved_recipients_are_guarded(tmp_path):
+    """The draft's REAL recipients pass the guard even though the tool's
+    own kwargs carry none — closes the send_draft bypass."""
+    ctx = _ctx(tmp_path, send_enabled=True, ews_capability_tier="full",
+               ews_recipient_denylist="*@competitor.example")
+    content = {"subject": "s", "to": ["ceo@competitor.example"], "body_text": "x"}
+    spec = _preview_spec(_ok_handler, [content])
+    p1 = asyncio.run(dispatch(ctx, spec, {"draft_id": "RAW-1"}))
+    assert p1["error"]["code"] == "recipient_blocked"
+    assert "confirm_token" not in p1
+
+
 def test_audit_chain_written(tmp_path):
     ctx = _ctx(tmp_path)
     asyncio.run(dispatch(ctx, _spec(_ok_handler), {}))

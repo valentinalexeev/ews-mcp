@@ -1,9 +1,15 @@
 """Environment-driven configuration (12-factor; every knob defaults safe)."""
 
+from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Path fragments that identify cloud-synced folders. The data dir holds
+# mail-at-rest (alias DB, audit chain, cache mirror) — it must never ride
+# a sync client onto other machines or a vendor cloud.
+_SYNCED_MARKERS = ("onedrive", "dropbox", "google drive", "googledrive", "icloud")
 
 
 class Settings(BaseSettings):
@@ -36,7 +42,7 @@ class Settings(BaseSettings):
     ews_capability_tier: Literal["read", "draft", "full"] = "draft"
     send_enabled: bool = False  # kill-switch: v5 defaults SAFE (off)
     send_confirm_secret: Optional[str] = None
-    confirm_ttl_seconds: int = 300
+    confirm_ttl_seconds: int = 600  # ONE default everywhere (== confirm.DEFAULT_TTL_SECONDS)
     ews_recipient_allowlist: str = ""
     ews_recipient_denylist: str = ""
     ews_max_sends_per_hour: int = 10
@@ -49,11 +55,30 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # --- Storage (NEVER a synced folder) -------------------------------------
-    data_dir: str = "data"
+    data_dir: str = ""  # empty → ~/.ewsmcp; always resolved to an absolute path
+    data_dir_allow_synced: bool = False  # explicit opt-out of the synced-path guard
 
     # --- Response economy ----------------------------------------------------
     default_page_size: int = Field(default=20, le=50)
     body_max_chars: int = 4000
+
+    @model_validator(mode="after")
+    def _resolve_data_dir(self) -> "Settings":
+        raw = self.data_dir or str(Path.home() / ".ewsmcp")
+        resolved = Path(raw).expanduser().resolve()
+        if not self.data_dir_allow_synced:
+            lowered = str(resolved).lower()
+            marker = next((m for m in _SYNCED_MARKERS if m in lowered), None)
+            if marker is not None:
+                raise ValueError(
+                    f"DATA_DIR {resolved} appears to be inside a cloud-synced "
+                    f"folder ({marker!r}). It stores mail-at-rest (aliases, "
+                    "audit chain, cache) and must stay local — point DATA_DIR "
+                    "at a local path, or set DATA_DIR_ALLOW_SYNCED=true to "
+                    "accept the risk deliberately."
+                )
+        self.data_dir = str(resolved)
+        return self
 
 
 def get_settings() -> Settings:

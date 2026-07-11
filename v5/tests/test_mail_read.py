@@ -276,9 +276,13 @@ def test_get_thread_merges_inbox_and_sent_chronologically(tmp_path):
     assert res["items"][2].get("attach") is True
     assert sum(p["msgs"] for p in res["participants"]) == 3
     assert res["participants"][0]["name_or_email"] == "ahmed@corp.example"
-    # conversation_id must be passed as a STRING (5.0.3: the object raises)
+    # conversation_id must be passed as the ConversationId OBJECT — 5.0.3
+    # raises TypeError on a plain string (verified against the installed
+    # library; the old pin here asserted the broken behavior).
     for folder in (account.inbox, account.sent):
-        assert folder.filter_calls[0][1] == {"conversation_id": "CONV-RAW-1="}
+        passed = folder.filter_calls[0][1]["conversation_id"]
+        assert passed is msg_a.conversation_id
+        assert passed.id == "CONV-RAW-1="
 
 
 def test_get_thread_caps_at_limit_keeping_latest(tmp_path):

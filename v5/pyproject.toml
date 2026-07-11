@@ -9,10 +9,19 @@ description = "Greenfield EWS MCP server — 24 consolidated tools for an execut
 requires-python = ">=3.11"
 dependencies = [
     "exchangelib==5.0.3",
+    "jsonschema>=4.21",
     "mcp>=1.27,<2",
     "pydantic>=2.8",
     "pydantic-settings>=2.5",
+    "tzdata",  # zoneinfo source of truth: slim images/Windows ship no OS tzdb
     "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
 ]
 
 [project.scripts]
