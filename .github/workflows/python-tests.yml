@@ -15,6 +15,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # secrets.* is not a valid context inside step `if:` expressions —
+      # mirror the token into env so the upload step can gate on it.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     strategy:
       fail-fast: false  # Don't cancel other matrix jobs on failure
       matrix:
@@ -56,12 +60,12 @@ jobs:
         continue-on-error: true
 
       - name: Upload coverage reports
-        if: always() && secrets.CODECOV_TOKEN != ''
+        if: always() && env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.xml
           flags: unittests
           name: codecov-${{ matrix.python-version }}
           fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ env.CODECOV_TOKEN }}
         continue-on-error: true
