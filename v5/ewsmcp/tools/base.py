@@ -87,6 +87,9 @@ class Context:
     manager: Any  # ConnectionManager | None
     aliaser: Any
     audit: Any
+    cache: Any = None  # CacheStore | None (None = cache disabled/broken)
+    sync: Any = None  # SyncEngine | None
+    semantic: Any = None  # SemanticIndex adapter | None
     registry: Dict[str, ToolSpec] = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     counters: Dict[str, int] = field(default_factory=dict)

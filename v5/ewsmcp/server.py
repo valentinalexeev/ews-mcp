@@ -48,12 +48,23 @@ def build_context(settings: Settings) -> Context:
     except Exception as exc:
         logger.error("audit init failed (%s) — audit disabled", exc)
         audit = _NullAudit()
+    cache = None
+    if settings.ews_cache_enabled:
+        try:
+            from .cache import CacheStore
+            cache = CacheStore(f"{settings.data_dir}/cache/mirror.db")
+            if settings.ews_cache_purge_on_boot:
+                cache.purge()
+        except Exception as exc:
+            logger.error("cache init failed (%s) — running pure-EWS reads", exc)
+            cache = None
     ctx = Context(
         settings=settings,
         gateway=gateway,
         manager=None,
         aliaser=aliaser,
         audit=audit,
+        cache=cache,
     )
     build_registry(ctx)
     return ctx
@@ -66,7 +77,21 @@ async def start_connection_manager(ctx: Context) -> None:
         heartbeat_seconds=int(ctx.settings.ews_heartbeat_seconds),
     )
     ctx.manager = manager
-    await manager.start()
+
+    async def on_warm() -> None:
+        # The sync engine is owned by the warm state: it starts only once
+        # Exchange has answered (and keeps running through later outages —
+        # its own cycles degrade gracefully).
+        if ctx.cache is not None and ctx.sync is None:
+            try:
+                from .cache import SyncEngine
+                ctx.sync = SyncEngine(ctx.settings, ctx.gateway, ctx.cache)
+                await ctx.sync.start()
+            except Exception as exc:
+                logger.error("sync engine start failed (%s) — cache stays "
+                             "stale; reads fall back to live EWS", exc)
+
+    await manager.start(on_warm=on_warm)
     logger.info("Exchange warmup running in background (see /readyz)")
 
 

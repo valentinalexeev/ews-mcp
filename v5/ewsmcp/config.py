@@ -58,6 +58,17 @@ class Settings(BaseSettings):
     data_dir: str = ""  # empty → ~/.ewsmcp; always resolved to an absolute path
     data_dir_allow_synced: bool = False  # explicit opt-out of the synced-path guard
 
+    # --- Cache mirror (cache-first reads; false = pure EWS, fully functional)
+    ews_cache_enabled: bool = True
+    ews_cache_folders: str = "inbox,sent"
+    ews_cache_sync_seconds: int = 45
+    ews_cache_hierarchy_seconds: int = 600
+    ews_cache_window_days: int = 365
+    ews_cache_purge_on_boot: bool = False  # admin path: wipe + resync from scratch
+
+    # --- Optional semantic tier (adapter; core stays dependency-free) --------
+    ews_semantic_index: Literal["none", "pgvector"] = "none"
+
     # --- Response economy ----------------------------------------------------
     default_page_size: int = Field(default=20, le=50)
     body_max_chars: int = 4000

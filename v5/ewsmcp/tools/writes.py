@@ -31,6 +31,7 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
 """
 
 import html as _html
+import logging
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -46,7 +47,24 @@ from ..dates import parse_when
 from ..errors import ToolError
 from .base import Context, ToolSpec
 
+logger = logging.getLogger(__name__)
+
 MAX_BULK_IDS = 50
+
+
+def _write_through(ctx: Context, method: str, *args: Any) -> None:
+    """Patch the mirror after a successful EWS mutation. Cache failures are
+    logged and swallowed — the delta sync repairs the mirror within one
+    cycle, and a cache hiccup must never fail a write that already
+    succeeded upstream."""
+    cache = getattr(ctx, "cache", None)
+    if cache is None:
+        return
+    try:
+        getattr(cache, method)(*args)
+    except Exception as exc:
+        logger.warning("write-through %s failed (sync will repair): %s",
+                       method, exc)
 _DRAFT_MODES = ("new", "reply", "reply_all", "forward")
 _RESPONSE_METHOD = {"accept": "accept", "tentative": "tentatively_accept", "decline": "decline"}
 _OOF_STATE = {
@@ -303,6 +321,8 @@ async def _update_messages(ctx: Context, *, ids: List[str],
         raise ToolError("validation",
                         "nothing to update: pass set_read and/or categories_add/_remove")
     remove = set(categories_remove or [])
+    ok_ids: List[str] = []
+    final_cats: List[tuple] = []
 
     def work(account: Any) -> Dict[str, Any]:
         updated, failed = 0, []
@@ -323,18 +343,27 @@ async def _update_messages(ctx: Context, *, ids: List[str],
                             cats.append(c)
                     item.categories = cats or None
                     changed.append("categories")
+                    final_cats.append((raw_id, cats))
                 item.save(update_fields=changed)
                 updated += 1
+                ok_ids.append(raw_id)
             except Exception as exc:
                 failed.append(_failed_entry(ctx, raw_id, exc))
         return {"updated": updated, "failed": failed}
 
-    return await ctx.gateway.call(work)
+    result = await ctx.gateway.call(work)
+    if ok_ids and set_read is not None:
+        _write_through(ctx, "set_read_flag", ok_ids, bool(set_read))
+    for raw_id, cats in final_cats:
+        _write_through(ctx, "apply_categories", raw_id, cats)
+    return result
 
 
 async def _move_messages(ctx: Context, *, ids: List[str],
                          to_folder: str) -> Dict[str, Any]:
     _require_bulk(ids)
+
+    moved_old_ids: List[str] = []
 
     def work(account: Any) -> Dict[str, Any]:
         folder = ctx.gateway.resolve_folder(account, to_folder, ctx.aliaser)
@@ -360,11 +389,17 @@ async def _move_messages(ctx: Context, *, ids: List[str],
                     row["note"] = ("moved, but Exchange returned no new id — "
                                    "re-search before reusing this id")
                 moved.append(row)
+                moved_old_ids.append(raw_id)
             except Exception as exc:
                 failed.append(_failed_entry(ctx, raw_id, exc))
         return {"moved": len(moved), "items": moved, "failed": failed}
 
-    return await ctx.gateway.call(work)
+    result = await ctx.gateway.call(work)
+    # Tombstone the moved rows: their old ids are gone from the source
+    # folder; the delta sync re-adds them under the new id if the target
+    # folder is mirrored.
+    _write_through(ctx, "tombstone_messages", moved_old_ids)
+    return result
 
 
 async def _create_event(ctx: Context, *, subject: str, start: str, end: str,
@@ -620,6 +655,8 @@ async def _delete_messages(ctx: Context, *, ids: List[str],
                         "disposition must be 'trash', 'soft' or 'permanent'")
     _require_bulk(ids)
 
+    deleted_ids: List[str] = []
+
     def work(account: Any) -> Dict[str, Any]:
         deleted, failed = 0, []
         fetched = _fetch_many(account, ids, only=["id", "changekey"])
@@ -635,11 +672,14 @@ async def _delete_messages(ctx: Context, *, ids: List[str],
                     # 5.0.3: Item.delete() IS HardDelete — no disposal kwarg.
                     item.delete()
                 deleted += 1
+                deleted_ids.append(raw_id)
             except Exception as exc:
                 failed.append(_failed_entry(ctx, raw_id, exc))
         return {"deleted": deleted, "disposition": disposition, "failed": failed}
 
-    return await ctx.gateway.call(work)
+    result = await ctx.gateway.call(work)
+    _write_through(ctx, "tombstone_messages", deleted_ids)
+    return result
 
 
 # --- schemas ------------------------------------------------------------------

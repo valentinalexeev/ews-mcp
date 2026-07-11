@@ -315,7 +315,26 @@ async def _find_people(ctx: Context, query: str, source: str = "auto",
                     matched.append(contact)
         return gal, matched
 
-    gal_entries, contact_items = await ctx.gateway.call(work)
+    try:
+        gal_entries, contact_items = await ctx.gateway.call(work)
+    except Exception:
+        # Live GAL/contacts unavailable — answer from mail history if the
+        # mirror is warm (degraded but useful), else re-raise for mapping.
+        if ctx.cache is None:
+            raise
+        rows = ctx.cache.senders_matching(q, limit=max(0, int(limit)))
+        if not rows:
+            raise
+        people = [{
+            "id": ctx.aliaser.alias_for(r["sender_email"], "p"),
+            "name": r["sender_name"] or r["sender_email"],
+            "email": r["sender_email"],
+            "source": "mirror",
+            "history": {"received_count": r["msgs"], "last_received": r["last_seen"]},
+        } for r in rows]
+        out = envelope(people, len(people), 0)
+        out["source"] = "cache"
+        return out
     candidates: List[Tuple[str, Dict[str, Any]]] = []
     for entry in gal_entries:
         if isinstance(entry, Exception):  # ErrorNameResolutionNoResults etc.
@@ -337,6 +356,14 @@ async def _find_people(ctx: Context, query: str, source: str = "auto",
         # Mint aliases only for survivors so dropped duplicates never
         # consume p-numbers.
         people.append({"id": ctx.aliaser.alias_for(raw_key, "p"), **person})
+    if ctx.cache is not None:
+        for person in people[:max(0, int(limit))]:
+            try:
+                stats = ctx.cache.contact_stats(person["email"])
+            except Exception:
+                break  # enrichment only — never degrade the live answer
+            if stats:
+                person["history"] = stats
     total = len(people)
     return envelope(people[:max(0, int(limit))], total, 0)
 
@@ -363,6 +390,17 @@ async def _get_oof_settings(ctx: Context) -> Dict[str, Any]:
 
 async def _get_server_status(ctx: Context) -> Dict[str, Any]:
     # requires_ews=False: answers even while Exchange is cold. No network.
+    cache_block: Dict[str, Any] = {
+        "enabled": bool(getattr(ctx.settings, "ews_cache_enabled", False)),
+        "ready": ctx.cache is not None,
+    }
+    if ctx.cache is not None:
+        try:
+            cache_block.update(ctx.cache.stats())
+        except Exception as exc:
+            cache_block["error"] = str(exc)
+    if ctx.sync is not None:
+        cache_block["sync"] = ctx.sync.status()
     return {
         "ok": True,
         "version": __version__,
@@ -373,6 +411,7 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
         "tools": len(ctx.registry),
         "counters": dict(ctx.counters),
         "alias_stats": ctx.aliaser.stats(),
+        "cache": cache_block,
     }
 
 
