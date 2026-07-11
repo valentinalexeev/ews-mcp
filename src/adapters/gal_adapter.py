@@ -286,9 +286,9 @@ class GALAdapter:
         """
         Strategy 3: Domain-based search.
 
-        Find all users from a specific domain (e.g., @sdb.gov.sa).
+        Find all users from a specific domain (e.g., @example.com).
 
-        This is useful when searching for "everyone at SDB".
+        This is useful when searching for "everyone at Acme".
         """
         try:
             # Try searching with domain query

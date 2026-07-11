@@ -79,12 +79,12 @@ def test_denylist_blocks_matching_recipient():
 
 def test_allowlist_blocks_unlisted_recipient():
     tool = _SendTool(_FakeClient(_settings(
-        ews_recipient_allowlist="*@example.com",
+        ews_recipient_allowlist="*@acme.example",
     )))
     blocked = asyncio.run(tool.safe_execute(to=["x@gmail.example"]))
     assert blocked["success"] is False
     assert "allowlist" in blocked["error"]
-    allowed = asyncio.run(tool.safe_execute(to=["ahmed@example.com"]))
+    allowed = asyncio.run(tool.safe_execute(to=["colleague@acme.example"]))
     assert allowed.get("sent") is True
 
 

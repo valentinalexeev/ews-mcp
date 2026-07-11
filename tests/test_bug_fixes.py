@@ -75,7 +75,7 @@ async def test_find_meeting_times_all_free(mock_ews_client):
 
     tool = FindMeetingTimesTool(mock_ews_client)
     result = await tool.execute(
-        attendees=["amazrou@sdb.gov.sa"],
+        attendees=["attendee@example.com"],
         date_range_start="2026-04-18T08:00:00",
         date_range_end="2026-04-18T18:00:00",
         duration_minutes=30,
@@ -104,7 +104,7 @@ async def test_find_meeting_times_partial_busy(mock_ews_client):
 
     tool = FindMeetingTimesTool(mock_ews_client)
     result = await tool.execute(
-        attendees=["amazrou@sdb.gov.sa"],
+        attendees=["attendee@example.com"],
         date_range_start="2026-04-18T08:00:00",
         date_range_end="2026-04-18T18:00:00",
         duration_minutes=30,
@@ -125,7 +125,7 @@ async def test_find_meeting_times_missing_merged_returns_zero(mock_ews_client):
 
     tool = FindMeetingTimesTool(mock_ews_client)
     result = await tool.execute(
-        attendees=["amazrou@sdb.gov.sa"],
+        attendees=["attendee@example.com"],
         date_range_start="2026-04-18T08:00:00",
         date_range_end="2026-04-18T18:00:00",
         duration_minutes=30,
@@ -146,7 +146,7 @@ async def test_find_meeting_times_legacy_attribute(mock_ews_client):
 
     tool = FindMeetingTimesTool(mock_ews_client)
     result = await tool.execute(
-        attendees=["amazrou@sdb.gov.sa"],
+        attendees=["attendee@example.com"],
         date_range_start="2026-04-18T08:00:00",
         date_range_end="2026-04-18T18:00:00",
         duration_minutes=30,

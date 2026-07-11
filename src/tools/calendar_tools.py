@@ -352,7 +352,7 @@ class GetCalendarTool(BaseTool):
                 f"Retrieved {len(events)} events",
                 events=events,
                 # Canonical envelope aliases. ``events`` is kept for back-compat
-                # with existing callers (e.g. downstream callers' items_of()), while
+                # with existing downstream callers, while
                 # ``items``/``count`` align with the paged-search envelope.
                 items=events,
                 count=len(events),

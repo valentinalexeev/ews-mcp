@@ -62,7 +62,7 @@ class EWSGateway:
             retry_policy=FaultTolerance(max_wait=s.ews_retry_max_wait_seconds),
         )
         if s.ews_auth_type_force:  # escape hatch for a DIFFERENT Exchange only
-            logger.warning("auth_type FORCED to %s — known to break exchange.example.com",
+            logger.warning("auth_type FORCED to %s — the primary Exchange requires auto-negotiation",
                            s.ews_auth_type_force)
             kwargs["auth_type"] = s.ews_auth_type_force
         config = Configuration(**kwargs)
