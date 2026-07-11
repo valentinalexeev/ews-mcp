@@ -53,6 +53,50 @@ async def _send_json(send, status: int, payload: Dict[str, Any]) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+def _metrics_text(ctx) -> str:
+    """Prometheus exposition (text format 0.0.4). Behind the API key like
+    every non-health endpoint — scrape with a bearer token."""
+    import time as _t
+    lines = [
+        "# TYPE ewsmcp_uptime_seconds gauge",
+        f"ewsmcp_uptime_seconds {int(_t.time() - ctx.started_at)}",
+    ]
+    state = ctx.manager.state if ctx.manager else "unmanaged"
+    lines += ["# TYPE ewsmcp_connection_warm gauge",
+              f"ewsmcp_connection_warm {1 if state in ('warm', 'unmanaged') else 0}"]
+    lines.append("# TYPE ewsmcp_tool_calls_total counter")
+    lines.append("# TYPE ewsmcp_errors_total counter")
+    for key, value in sorted(ctx.counters.items()):
+        if key.startswith("tool."):
+            lines.append(f'ewsmcp_tool_calls_total{{tool="{key[5:]}"}} {value}')
+        elif key.startswith("err."):
+            lines.append(f'ewsmcp_errors_total{{code="{key[4:]}"}} {value}')
+    if ctx.cache is not None:
+        try:
+            stats = ctx.cache.stats()
+            lines.append("# TYPE ewsmcp_cache_rows gauge")
+            for table, n in stats.get("rows", {}).items():
+                lines.append(f'ewsmcp_cache_rows{{table="{table}"}} {n}')
+            lines.append("# TYPE ewsmcp_cache_db_mb gauge")
+            lines.append(f"ewsmcp_cache_db_mb {stats.get('db_mb', 0)}")
+        except Exception:
+            pass
+    if ctx.sync is not None:
+        status = ctx.sync.status()
+        lines.append("# TYPE ewsmcp_sync_cycles_total counter")
+        lines.append(f"ewsmcp_sync_cycles_total {status.get('cycles', 0)}")
+        age = status.get("last_cycle_age_s")
+        if age is not None:
+            lines.append("# TYPE ewsmcp_sync_last_cycle_age_seconds gauge")
+            lines.append(f"ewsmcp_sync_last_cycle_age_seconds {age}")
+        lines.append("# TYPE ewsmcp_sync_degraded gauge")
+        lines.append(f"ewsmcp_sync_degraded {1 if status.get('last_error') else 0}")
+    if ctx.semantic is not None:
+        lines.append("# TYPE ewsmcp_semantic_enabled gauge")
+        lines.append("ewsmcp_semantic_enabled 1")
+    return "\n".join(lines) + "\n"
+
+
 def _openapi(ctx) -> Dict[str, Any]:
     paths = {}
     for name, spec in ctx.registry.items():
@@ -142,6 +186,13 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
                     "code": "upstream_unavailable",
                     "message": "MCP transport not mounted"}})
             return await streamable.handle_request(scope, receive, send)
+        if path == "/metrics" and method == "GET":
+            body = _metrics_text(ctx).encode()
+            await send({"type": "http.response.start", "status": 200, "headers": [
+                [b"content-type", b"text/plain; version=0.0.4; charset=utf-8"],
+                [b"content-length", str(len(body)).encode()],
+            ]})
+            return await send({"type": "http.response.body", "body": body})
         if path == "/openapi.json" and method == "GET":
             return await _send_json(send, 200, _openapi(ctx))
         if path == "/api/tools" and method == "GET":

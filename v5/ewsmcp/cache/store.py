@@ -120,7 +120,43 @@ CREATE TABLE IF NOT EXISTS sync_state (
     token TEXT,
     as_of INTEGER
 );
+CREATE TABLE IF NOT EXISTS sender_sigs (
+    sender_email TEXT NOT NULL,
+    sig_hash     TEXT NOT NULL,
+    hits         INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (sender_email, sig_hash)
+);
 """
+
+# A trailing block must recur this often before reads strip it — one
+# coincidental match must never delete real content.
+SIG_MIN_HITS = 3
+_SIG_MAX_LINES = 6
+_SIG_MAX_CHARS = 400
+
+
+def trailing_block(body: str) -> Optional[str]:
+    """The candidate signature block: the last blank-line-separated block,
+    when it is short enough to be a signature and is not the whole body."""
+    body = (body or "").rstrip()
+    if not body:
+        return None
+    head, sep, tail = body.rpartition("\n\n")
+    if not sep or not head.strip():
+        return None
+    tail = tail.strip()
+    if not tail or len(tail) > _SIG_MAX_CHARS:
+        return None
+    if tail.count("\n") + 1 > _SIG_MAX_LINES:
+        return None
+    return tail
+
+
+def _sig_hash(sender_email: str, block: str) -> str:
+    import hashlib
+    return hashlib.sha256(
+        f"{sender_email.lower()}|{normalize_ar(block)}".encode()
+    ).hexdigest()
 
 
 class CacheStore:
@@ -202,10 +238,26 @@ class CacheStore:
         )
 
     def upsert_messages(self, rows: List[Dict[str, Any]]) -> int:
-        """Insert/update message rows in ONE transaction (sync + write-through)."""
+        """Insert/update message rows in ONE transaction (sync + write-through).
+
+        Also LEARNS per-sender signatures: the trailing block of each body
+        is hashed per sender; once the same block recurs SIG_MIN_HITS times
+        the read paths strip it (closes the measured gap where a corporate
+        signature survived clean_body)."""
         if not rows:
             return 0
         with self._write() as conn:
+            for r in rows:
+                block = trailing_block(r.get("body_clean") or "")
+                sender = (r.get("sender_email") or "").lower()
+                if block and sender:
+                    conn.execute(
+                        "INSERT INTO sender_sigs (sender_email, sig_hash, hits) "
+                        "VALUES (?, ?, 1) "
+                        "ON CONFLICT(sender_email, sig_hash) "
+                        "DO UPDATE SET hits = hits + 1",
+                        (sender, _sig_hash(sender, block)),
+                    )
             for r in rows:
                 conn.execute(
                     """
@@ -337,7 +389,8 @@ class CacheStore:
         """Drop every mirrored row and sync token (admin path; the next
         sync cycle rebuilds from scratch)."""
         with self._write() as conn:
-            for table in ("messages", "events", "tasks", "folders", "sync_state"):
+            for table in ("messages", "events", "tasks", "folders",
+                          "sync_state", "sender_sigs"):
                 conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed names
         logger.warning("cache purged: %s", self.db_path)
 
@@ -436,6 +489,26 @@ class CacheStore:
                 [*params, int(limit), int(offset)],
             ).fetchall()
         return rows, int(total)
+
+    def strip_learned_signature(self, sender_email: str, body: str) -> str:
+        """Drop the trailing block when it is a LEARNED signature for this
+        sender (recurred >= SIG_MIN_HITS times). Deterministic, read-only."""
+        block = trailing_block(body)
+        sender = (sender_email or "").lower()
+        if not block or not sender:
+            return body
+        try:
+            with self._read() as conn:
+                row = conn.execute(
+                    "SELECT hits FROM sender_sigs WHERE sender_email=? "
+                    "AND sig_hash=?",
+                    (sender, _sig_hash(sender, block)),
+                ).fetchone()
+        except sqlite3.Error:
+            return body
+        if row is not None and row["hits"] >= SIG_MIN_HITS:
+            return body.rstrip().rpartition("\n\n")[0].rstrip()
+        return body
 
     def get_message(self, ews_id: str) -> Optional[sqlite3.Row]:
         with self._read() as conn:

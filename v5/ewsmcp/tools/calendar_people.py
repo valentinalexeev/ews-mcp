@@ -368,6 +368,59 @@ async def _find_people(ctx: Context, query: str, source: str = "auto",
     return envelope(people[:max(0, int(limit))], total, 0)
 
 
+async def _get_contact(ctx: Context, id: str) -> Dict[str, Any]:
+    """Consumer for the p-aliases find_people mints. Accepts a p-alias
+    (already resolved to its raw key by the dispatcher), a raw contact id,
+    or a plain email address."""
+    key = (id or "").strip()
+    if not key:
+        raise ToolError("validation", "'id' must be a p-alias, contact id or email.")
+
+    def work(account: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if "@" in key:  # GAL raw keys ARE the address
+            for entry in account.protocol.resolve_names(
+                    [key], return_full_contact_data=True):
+                if isinstance(entry, Exception):
+                    continue
+                built = _gal_person(entry)
+                if built:
+                    return built
+            return None
+        fetched = list(account.fetch(ids=[(key, None)]))
+        item = fetched[0] if fetched else None
+        if isinstance(item, Exception):
+            raise item
+        return _contact_person(item) if item is not None else None
+
+    person: Optional[Dict[str, Any]] = None
+    raw_key = key
+    try:
+        built = await ctx.gateway.call(work)
+        if built:
+            raw_key, person = built
+    except Exception:
+        if ctx.cache is None:
+            raise
+    if person is None and ctx.cache is not None and "@" in key:
+        # GAL unavailable or no match — mail history still knows them.
+        rows = ctx.cache.senders_matching(key, limit=1)
+        if rows:
+            person = {"name": rows[0]["sender_name"] or key, "email": key,
+                      "source": "mirror"}
+    if person is None:
+        raise ToolError("not_found", f"No contact found for {id!r}.",
+                        hint="Use find_people to search by name or fragment.")
+    if ctx.cache is not None:
+        try:
+            stats = ctx.cache.contact_stats(person["email"])
+            if stats:
+                person["history"] = stats
+        except Exception:
+            pass
+    return {"ok": True,
+            "person": {"id": ctx.aliaser.alias_for(raw_key, "p"), **person}}
+
+
 async def _get_oof_settings(ctx: Context) -> Dict[str, Any]:
     tz = ctx.settings.ews_tz
     oof = await ctx.gateway.call(lambda account: account.oof_settings)
@@ -526,6 +579,27 @@ TOOLS: List[ToolSpec] = [
             "additionalProperties": False,
         },
         handler=_find_people,
+    ),
+    ToolSpec(
+        name="get_contact",
+        description=(
+            "Fetch one person in full by id — a p-alias from find_people, a "
+            "raw contact id, or a plain email address. Returns name/email/"
+            "title/company/phone where known, plus mirror-derived history "
+            "(first/last contact, sent/received counts) when the local "
+            "mirror is warm."
+        ),
+        side_effect_class="read",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "id": {"type": "string",
+                       "description": "p-alias, raw contact id, or email."},
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+        handler=_get_contact,
     ),
     ToolSpec(
         name="get_oof_settings",

@@ -1,13 +1,18 @@
-"""Tool registry: 24 tools in three packs (IDEATION §5), tier-filtered."""
+"""Tool registry: 28 tools in four packs (+find_similar when the semantic
+tier is enabled), tier-filtered. The count is asserted by boot smokes and
+the generated docs — change it DELIBERATELY."""
 
 from typing import Dict
 
 from .base import CLASS_TIER, TIER_RANK, Context, ToolSpec
-from . import mail_read, calendar_people, writes
+from . import mail_read, calendar_people, tasks, writes
 
 
 def build_registry(ctx: Context) -> Dict[str, ToolSpec]:
-    specs = [*mail_read.TOOLS, *calendar_people.TOOLS, *writes.TOOLS]
+    specs = [*mail_read.TOOLS, *calendar_people.TOOLS, *tasks.TOOLS,
+             *writes.TOOLS]
+    if getattr(ctx, "semantic", None) is not None:
+        specs.extend(mail_read.SEMANTIC_TOOLS)
     tier = ctx.settings.ews_capability_tier
     registry: Dict[str, ToolSpec] = {}
     for spec in specs:

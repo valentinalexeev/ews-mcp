@@ -127,10 +127,12 @@ def row_from_task(item: Any, tz: str) -> Dict[str, Any]:
 
 
 class SyncEngine:
-    def __init__(self, settings: Any, gateway: Any, store: CacheStore):
+    def __init__(self, settings: Any, gateway: Any, store: CacheStore,
+                 semantic: Any = None):
         self.settings = settings
         self.gateway = gateway
         self.store = store
+        self.semantic = semantic  # optional vector tier; failures degrade
         self.folder_keys = [
             k.strip().lower()
             for k in (settings.ews_cache_folders or "").split(",") if k.strip()
@@ -227,6 +229,16 @@ class SyncEngine:
                 self.store.set_read_flag([ews_id], is_read)
             self.store.set_sync_state(f"item:{key}", folder.item_sync_state,
                                       time.time())
+            if self.semantic is not None and (upserts or deletes):
+                try:  # embeddings ride the sync, never gate it
+                    self.semantic.add([
+                        {"ews_id": r["ews_id"],
+                         "text": f"{r['subject']}\n{r['body_clean']}"}
+                        for r in upserts
+                    ])
+                    self.semantic.delete(deletes)
+                except Exception as exc:
+                    logger.warning("semantic indexing skipped this cycle: %s", exc)
 
     def _sync_slow_lane(self, account: Any) -> None:
         """Folder tree + expanded calendar window + tasks (every ~10 min)."""

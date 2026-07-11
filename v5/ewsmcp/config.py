@@ -68,6 +68,9 @@ class Settings(BaseSettings):
 
     # --- Optional semantic tier (adapter; core stays dependency-free) --------
     ews_semantic_index: Literal["none", "pgvector"] = "none"
+    ews_semantic_pg_dsn: Optional[str] = None  # from env only, never committed
+    ews_semantic_ollama_url: str = "http://localhost:11434"
+    ews_semantic_model: str = "bge-m3"  # 1024-d, Arabic-capable
 
     # --- Response economy ----------------------------------------------------
     default_page_size: int = Field(default=20, le=50)

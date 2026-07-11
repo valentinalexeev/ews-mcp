@@ -58,6 +58,12 @@ def build_context(settings: Settings) -> Context:
         except Exception as exc:
             logger.error("cache init failed (%s) — running pure-EWS reads", exc)
             cache = None
+    semantic = None
+    try:
+        from .semantic import build_semantic_index
+        semantic = build_semantic_index(settings)
+    except Exception as exc:
+        logger.error("semantic index init failed (%s) — keyword-only", exc)
     ctx = Context(
         settings=settings,
         gateway=gateway,
@@ -65,6 +71,7 @@ def build_context(settings: Settings) -> Context:
         aliaser=aliaser,
         audit=audit,
         cache=cache,
+        semantic=semantic,
     )
     build_registry(ctx)
     return ctx
@@ -85,7 +92,8 @@ async def start_connection_manager(ctx: Context) -> None:
         if ctx.cache is not None and ctx.sync is None:
             try:
                 from .cache import SyncEngine
-                ctx.sync = SyncEngine(ctx.settings, ctx.gateway, ctx.cache)
+                ctx.sync = SyncEngine(ctx.settings, ctx.gateway, ctx.cache,
+                                      semantic=ctx.semantic)
                 await ctx.sync.start()
             except Exception as exc:
                 logger.error("sync engine start failed (%s) — cache stays "

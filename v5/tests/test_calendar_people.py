@@ -62,10 +62,10 @@ def _event(raw_id="RAW-EV-1", subject="Standup", start=None, end=None):
 # --- pack contract ----------------------------------------------------------
 
 
-def test_pack_exports_six_read_specs():
+def test_pack_exports_seven_read_specs():
     assert [s.name for s in calendar_people.TOOLS] == [
         "list_events", "get_event", "check_availability",
-        "find_people", "get_oof_settings", "get_server_status",
+        "find_people", "get_contact", "get_oof_settings", "get_server_status",
     ]
     for spec in calendar_people.TOOLS:
         assert spec.side_effect_class == "read"
@@ -422,9 +422,11 @@ def test_get_server_status_with_manager_none(tmp_path):
     assert res["connection"] == {"state": "unmanaged"}
     assert res["tier"] == "draft"
     assert res["send_kill_switch"] is True  # send_enabled defaults False
-    assert res["tools"] == 6
+    assert res["tools"] == 7
     assert res["counters"]["tool.list_events"] == 3
     assert res["alias_stats"] == {"m": 1}
+    assert res["cache"]["enabled"] is True  # default posture
+    assert res["cache"]["ready"] is False  # no CacheStore in this ctx
 
 
 def test_get_server_status_not_cold_gated_while_connecting(tmp_path):
