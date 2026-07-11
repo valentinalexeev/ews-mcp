@@ -18,9 +18,16 @@ def fmt_dt(value: Any, tz: str) -> Optional[str]:
         return value.isoformat() if isinstance(value, datetime) else None
 
 
+_DERIVE = object()  # sentinel: derive next_offset from total_available
+
+
 def envelope(items: List[Dict[str, Any]], total_available: Optional[int],
-             offset: int) -> Dict[str, Any]:
-    """Canonical paged envelope: {items, count, total_available, next_offset}."""
+             offset: int, next_offset: Any = _DERIVE) -> Dict[str, Any]:
+    """Canonical paged envelope: {items, count, total_available, next_offset}.
+
+    ``next_offset`` may be passed explicitly (lookahead pagination knows it
+    without knowing the total); by default it derives from total_available.
+    """
     out: Dict[str, Any] = {
         "ok": True,
         "items": items,
@@ -28,7 +35,9 @@ def envelope(items: List[Dict[str, Any]], total_available: Optional[int],
         "total_available": total_available,
         "next_offset": None,
     }
-    if total_available is not None and offset + len(items) < total_available:
+    if next_offset is not _DERIVE:
+        out["next_offset"] = next_offset
+    elif total_available is not None and offset + len(items) < total_available:
         out["next_offset"] = offset + len(items)
     return out
 

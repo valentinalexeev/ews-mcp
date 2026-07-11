@@ -98,15 +98,37 @@ def test_list_events_uses_view_not_filter(tmp_path):
     assert res["items"][1]["id"] == "e2"
 
 
-def test_list_events_pagination_slices_client_side(tmp_path):
+def test_list_events_pagination_caps_the_view_server_side(tmp_path):
+    """The window expansion is capped via view(max_items=offset+limit+1) —
+    a year of recurrences is never materialized to render one page. A
+    truncated view means the exact total is unknown (None) but the
+    lookahead proves another page exists."""
+    events = [_event(f"RAW-{i}") for i in range(5)]
     account = MagicMock()
-    account.calendar.view.return_value = [_event(f"RAW-{i}") for i in range(5)]
+    account.calendar.view.side_effect = (
+        lambda *, start, end, max_items=None: events[:max_items])
     ctx = _ctx(tmp_path, account)
     res = _run(ctx, "list_events",
                {"start": "2026-06-15", "end": "2026-06-22", "offset": 1, "limit": 2})
+    assert account.calendar.view.call_args.kwargs["max_items"] == 4  # 1+2+1
     assert res["count"] == 2
-    assert res["total_available"] == 5
+    assert res["total_available"] is None  # view was truncated at the cap
     assert res["next_offset"] == 3
+
+    # Uncapped window (fewer events than the cap): exact total, no next page.
+    res2 = _run(ctx, "list_events",
+                {"start": "2026-06-15", "end": "2026-06-22", "offset": 0, "limit": 10})
+    assert res2["total_available"] == 5
+    assert res2["next_offset"] is None
+
+
+def test_list_events_rejects_absurd_windows(tmp_path):
+    account = MagicMock()
+    ctx = _ctx(tmp_path, account)
+    res = _run(ctx, "list_events", {"start": "today", "end": "+9999d"})
+    assert res["error"]["code"] == "validation"
+    assert "narrow" in res["error"]["message"]
+    account.calendar.view.assert_not_called()
 
 
 def test_list_events_relative_dates_today_plus_7d(tmp_path):
@@ -246,6 +268,47 @@ def test_check_availability_end_to_end(tmp_path):
     assert [e["status"] for e in per["a@corp.example"]] == ["Busy", "Free"]
     assert per["a@corp.example"][0]["start"] == "2026-06-15T09:00+03:00"
     assert per["b@corp.example"] == []
+
+
+def test_check_availability_degrades_per_attendee(tmp_path):
+    """One unresolvable attendee (external address, hidden calendar) gets an
+    {'error': ...} entry and a warning; the call itself succeeds and slots
+    are computed from the attendees that DID resolve."""
+    class ErrorMailRecipientNotFound(Exception):
+        pass
+
+    good_view = SimpleNamespace(calendar_events=[
+        SimpleNamespace(start=_dt(9), end=_dt(10), busy_type="Busy"),
+    ])
+    account = MagicMock()
+    account.protocol.get_free_busy_info.return_value = iter([
+        good_view, ErrorMailRecipientNotFound("no such mailbox"),
+    ])
+    ctx = _ctx(tmp_path, account)
+    res = _run(ctx, "check_availability", {
+        "attendees": ["a@corp.example", "ghost@external.example"],
+        "start": "2026-06-15T09:00", "end": "2026-06-15T11:00",
+    })
+    assert res["ok"] is True
+    assert res["per_attendee"]["ghost@external.example"]["error"].startswith(
+        "ErrorMailRecipientNotFound")
+    assert [e["status"] for e in res["per_attendee"]["a@corp.example"]] == ["Busy"]
+    assert res["slots"]  # computed from the resolvable attendee
+    assert any("ghost@external.example" in w for w in res["warnings"])
+
+
+def test_check_availability_all_attendees_failing_is_an_error(tmp_path):
+    account = MagicMock()
+    account.protocol.get_free_busy_info.return_value = iter([
+        RuntimeError("boom"),
+    ])
+    ctx = _ctx(tmp_path, account)
+    res = _run(ctx, "check_availability", {
+        "attendees": ["ghost@external.example"],
+        "start": "2026-06-15T09:00", "end": "2026-06-15T11:00",
+    })
+    assert res["ok"] is False
+    assert res["error"]["code"] == "upstream_error"
 
 
 # --- find_people ------------------------------------------------------------------

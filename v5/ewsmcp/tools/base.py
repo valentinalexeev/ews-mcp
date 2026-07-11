@@ -8,6 +8,7 @@ the spec supplies a preview hook) → send rate cap → alias resolution →
 handler (on the EWS pool) → audit.
 """
 
+import asyncio
 import fnmatch
 import threading
 import time
@@ -367,7 +368,10 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
                       for k in ("to", "cc", "subject", "id", "ids",
                                 "draft_id", "event_id")
                       if kwargs.get(k) is not None}
-        ctx.audit.record(
+        # Audit writes (file append + chain hash) run off the event loop —
+        # one slow disk must not stall every concurrent request.
+        await asyncio.to_thread(
+            ctx.audit.record,
             tool=spec.name, side_effect_class=spec.side_effect_class,
             outcome=outcome, latency_ms=int((time.time() - start) * 1000),
             transport=transport, detail=detail,

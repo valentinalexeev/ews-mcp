@@ -7,6 +7,7 @@ confirm gates. No direct exchangelib import: all EWS work goes through
 ``account`` attributes inside closures run on the gateway pool.
 """
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from ..bodyclean import clean_body
+from ..dates import parse_when
 from ..dto import envelope, event_card, fmt_dt, msg_card, msg_full
 from ..errors import ToolError
 from ..gateway.client import WELL_KNOWN, paginate
@@ -69,19 +71,20 @@ def _fetch_one(account: Any, raw_id: str, only: Optional[List[str]] = None) -> A
     return first
 
 
-def _parse_when(value: str, tz: str) -> datetime:
-    """ISO-8601 → tz-aware datetime; date-only means midnight in EWS_TZ."""
-    try:
-        dt = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        raise ToolError(
-            "validation",
-            f"Cannot parse date {value!r}.",
-            hint="Use ISO-8601: '2026-06-01' or '2026-06-01T09:30+03:00'.",
-        )
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo(tz))
-    return dt
+async def _cards_off_loop(ctx: Context, items: List[Any], tz: str) -> List[Dict[str, Any]]:
+    """Build msg cards on a worker thread: alias mints are SQLite write
+    transactions and body cleaning is regex-heavy — neither belongs on the
+    event loop. alias_many pre-mints the whole page in ONE transaction so
+    the per-card alias_for calls hit the read-only fast path."""
+    def build() -> List[Dict[str, Any]]:
+        ctx.aliaser.alias_many([
+            (str(it.id), "m", getattr(it, "changekey", None),
+             getattr(it, "message_id", None))
+            for it in items if getattr(it, "id", None)
+        ])
+        return [msg_card(it, ctx.aliaser, tz) for it in items]
+
+    return await asyncio.to_thread(build)
 
 
 def _from(item: Any) -> str:
@@ -178,21 +181,26 @@ async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int =
 
 
 async def _search_messages(ctx: Context, query: Optional[str] = None,
-                           folder: str = "f:inbox", from_: Optional[str] = None,
+                           folder: str = "f:inbox", sender: Optional[str] = None,
+                           from_: Optional[str] = None,
                            subject: Optional[str] = None, since: Optional[str] = None,
                            until: Optional[str] = None, is_unread: Optional[bool] = None,
                            has_attachments: Optional[bool] = None,
                            offset: int = 0, limit: int = 20) -> Dict[str, Any]:
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 50))
+    if sender and from_:
+        raise ToolError("validation",
+                        "pass `sender` only — `from_` is its deprecated alias.")
+    sender = sender or from_
     structured_given = any(
-        v is not None for v in (from_, subject, since, until, is_unread, has_attachments)
+        v is not None for v in (sender, subject, since, until, is_unread, has_attachments)
     )
     if query and structured_given:
         raise ToolError(
             "validation",
             "`query` (AQS) cannot be combined with the structured filters "
-            "(from_/subject/since/until/is_unread/has_attachments) — Exchange "
+            "(sender/subject/since/until/is_unread/has_attachments) — Exchange "
             "runs them on different engines.",
             hint="Either fold everything into the AQS string "
                  "(e.g. 'from:ahmed subject:rfp received>=2026-06-01') or drop "
@@ -203,33 +211,46 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     if subject:
         filters["subject__icontains"] = subject
     if since:
-        filters["datetime_received__gte"] = _parse_when(since, tz)
+        filters["datetime_received__gte"] = parse_when(since, "since", tz)
     if until:
-        filters["datetime_received__lte"] = _parse_when(until, tz)
+        filters["datetime_received__lte"] = parse_when(until, "until", tz)
     if is_unread is not None:
         filters["is_read"] = not is_unread
     if has_attachments is not None:
         filters["has_attachments"] = bool(has_attachments)
 
-    def work(account: Any) -> Tuple[List[Any], Optional[int]]:
-        target = ctx.gateway.resolve_folder(account, folder, ctx.aliaser)
-        qs = target.filter(query) if query else target.filter(**filters)
-        return paginate(_project(qs), offset=offset, limit=limit)
+    unfiltered = not query and not filters and not sender
 
-    items, total = await ctx.gateway.call(work)
-    if from_:
-        needle = from_.strip().lower()
+    def work(account: Any) -> Tuple[List[Any], Optional[int], Optional[int]]:
+        target = ctx.gateway.resolve_folder(account, folder, ctx.aliaser)
+        total: Optional[int] = None
+        if unfiltered:
+            # Exact totals are only cheap for a plain listing: one refreshed
+            # folder property instead of a count() full-folder scan.
+            try:
+                target.refresh()
+                total = getattr(target, "total_count", None)
+            except Exception:
+                total = None
+        qs = target.filter(query) if query else target.filter(**filters)
+        page, next_off = paginate(_project(qs), offset=offset, limit=limit)
+        return page, next_off, total
+
+    items, next_offset, total = await ctx.gateway.call(work)
+    if sender:
+        needle = sender.strip().lower()
 
         def hit(it: Any) -> bool:
-            sender = getattr(it, "sender", None)
-            email = (getattr(sender, "email_address", "") or "").lower()
-            name = (getattr(sender, "name", "") or "").lower()
+            sd = getattr(it, "sender", None)
+            email = (getattr(sd, "email_address", "") or "").lower()
+            name = (getattr(sd, "name", "") or "").lower()
             return needle in email or needle in name
 
         items = [it for it in items if hit(it)]
-        total = None  # client-side post-filter: the upstream count no longer applies
-    cards = [msg_card(it, ctx.aliaser, tz) for it in items]
-    return envelope(cards, total_available=total, offset=offset)
+        total = None  # client-side post-filter: the upstream total no longer applies
+    cards = await _cards_off_loop(ctx, items, tz)
+    return envelope(cards, total_available=total, offset=offset,
+                    next_offset=next_offset)
 
 
 # --------------------------------------------------------------------------
@@ -240,10 +261,13 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
 async def _get_message(ctx: Context, id: str, format: str = "full",
                        include_html: bool = False) -> Dict[str, Any]:
     raw_id = id
-    item = await ctx.gateway.call(lambda account: _fetch_one(account, raw_id))
     tz = ctx.settings.ews_tz
     if format == "concise":
+        # Card projection: never pull the full item (incl. MIME) for a card.
+        item = await ctx.gateway.call(
+            lambda account: _fetch_one(account, raw_id, only=list(_PROJECTION)))
         return {"ok": True, "message": msg_card(item, ctx.aliaser, tz)}
+    item = await ctx.gateway.call(lambda account: _fetch_one(account, raw_id))
     return {"ok": True, "message": msg_full(
         item, ctx.aliaser, tz, ctx.settings.body_max_chars,
         include_html=bool(include_html),
@@ -255,8 +279,10 @@ async def _get_message(ctx: Context, id: str, format: str = "full",
 # --------------------------------------------------------------------------
 
 
-async def _get_thread(ctx: Context, id: str, limit: int = 20) -> Dict[str, Any]:
+async def _get_thread(ctx: Context, id: str, limit: int = 20,
+                      offset: int = 0) -> Dict[str, Any]:
     limit = max(1, min(int(limit), 50))
+    offset = max(0, int(offset))
     raw_id = id
     tz = ctx.settings.ews_tz
 
@@ -294,30 +320,44 @@ async def _get_thread(ctx: Context, id: str, limit: int = 20) -> Dict[str, Any]:
 
     found.sort(key=sort_key)
     total = len(found)
-    if total > limit:
-        found = found[-limit:]  # chronological, most recent `limit` entries
-    counts: Dict[str, int] = {}
-    entries: List[Dict[str, Any]] = []
-    for it in found:
-        sender = _from(it) or "unknown"
-        counts[sender] = counts.get(sender, 0) + 1
-        raw = str(getattr(it, "id", "") or "")
-        entry: Dict[str, Any] = {
-            "id": ctx.aliaser.alias_for(
-                raw, "m", internet_message_id=getattr(it, "message_id", None),
-            ) if raw else None,
-            "from": sender,
-            "date": fmt_dt(getattr(it, "datetime_received", None), tz),
-            "body": clean_body(getattr(it, "text_body", None) or "",
-                               max_chars=1500)["text"],
-        }
-        if getattr(it, "has_attachments", False):
-            entry["attach"] = True
-        entries.append(entry)
-    participants = [
-        {"name_or_email": who, "msgs": n}
-        for who, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    ]
+    # Paging walks BACKWARDS through history: offset=0 is the most recent
+    # `limit` entries; pass the returned next_offset to fetch older ones.
+    hi = max(0, total - offset)
+    lo = max(0, hi - limit)
+    window = found[lo:hi]
+    next_offset = offset + len(window) if lo > 0 else None
+
+    def build() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        counts: Dict[str, int] = {}
+        for it in found:  # participants count the WHOLE thread, not the page
+            counts[_from(it) or "unknown"] = counts.get(_from(it) or "unknown", 0) + 1
+        ctx.aliaser.alias_many([
+            (str(it.id), "m", getattr(it, "changekey", None),
+             getattr(it, "message_id", None))
+            for it in window if getattr(it, "id", None)
+        ])
+        entries: List[Dict[str, Any]] = []
+        for it in window:
+            raw = str(getattr(it, "id", "") or "")
+            entry: Dict[str, Any] = {
+                "id": ctx.aliaser.alias_for(
+                    raw, "m", internet_message_id=getattr(it, "message_id", None),
+                ) if raw else None,
+                "from": _from(it) or "unknown",
+                "date": fmt_dt(getattr(it, "datetime_received", None), tz),
+                "body": clean_body(getattr(it, "text_body", None) or "",
+                                   max_chars=1500)["text"],
+            }
+            if getattr(it, "has_attachments", False):
+                entry["attach"] = True
+            entries.append(entry)
+        participants = [
+            {"name_or_email": who, "msgs": n}
+            for who, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        return entries, participants
+
+    entries, participants = await asyncio.to_thread(build)
     return {
         "ok": True,
         "thread_id": ctx.aliaser.alias_for(conv_str, "t"),
@@ -326,6 +366,7 @@ async def _get_thread(ctx: Context, id: str, limit: int = 20) -> Dict[str, Any]:
         "items": entries,
         "count": len(entries),
         "total_available": total,
+        "next_offset": next_offset,
     }
 
 
@@ -402,19 +443,27 @@ async def _get_mailbox_overview(ctx: Context, horizon_days: int = 1) -> Dict[str
     day_end = day_start + timedelta(days=horizon_days)
 
     def work(account: Any) -> Tuple[int, List[Any], List[Any]]:
+        try:
+            # unread_count is a stored field — refresh or report yesterday's.
+            account.inbox.refresh()
+        except Exception:
+            pass
         unread_total = getattr(account.inbox, "unread_count", None) or 0
         qs = _project(account.inbox.filter(is_read=False))
-        recent, _total = paginate(qs, offset=0, limit=10)
-        # .view() (not .filter()) so recurring events are expanded.
-        events = list(account.calendar.view(start=day_start, end=day_end))[:10]
+        recent, _next = paginate(qs, offset=0, limit=10)
+        # .view() (not .filter()) so recurring events are expanded; cap the
+        # expansion server-side instead of slicing an unbounded list.
+        events = list(account.calendar.view(start=day_start, end=day_end,
+                                            max_items=10))[:10]
         return unread_total, recent, events
 
     unread_total, recent, events = await ctx.gateway.call(work)
+    recent_cards = await _cards_off_loop(ctx, recent, tz)
     return {
         "ok": True,
         "generated_at": now.isoformat(timespec="seconds"),
         "unread_total": unread_total,
-        "recent_unread": [msg_card(it, ctx.aliaser, tz) for it in recent],
+        "recent_unread": recent_cards,
         "today_events": [event_card(ev, ctx.aliaser, tz) for ev in events],
         "connection": ctx.manager.state if ctx.manager else "unmanaged",
     }
@@ -467,9 +516,9 @@ TOOLS: List[ToolSpec] = [
         description=(
             "Search mail. TWO ENGINES, mutually exclusive: pass `query` (an "
             "Exchange AQS string, e.g. 'from:ahmed subject:rfp hasattachment:yes') "
-            "OR the structured filters (subject/since/until/is_unread/"
+            "OR the structured filters (sender/subject/since/until/is_unread/"
             "has_attachments) — combining `query` with any structured filter is "
-            "a validation error. `from_` is matched client-side against the "
+            "a validation error. `sender` is matched client-side against the "
             "fetched page's sender email/name, so total_available is unknown "
             "when it is used. Results are compact cards, newest first; their "
             "`id` values are short aliases (m12) for get_message / get_thread / "
@@ -488,21 +537,26 @@ TOOLS: List[ToolSpec] = [
                 "type": "string", "default": "f:inbox",
                 "description": "Folder alias (f:inbox, f:sent, f7), path, or raw id.",
             },
-            "from_": {
+            "sender": {
                 "type": "string",
                 "description": "Sender substring, matched client-side on the "
                                "fetched page (email or display name).",
             },
+            "from_": {
+                "type": "string",
+                "description": "DEPRECATED alias of `sender` — do not combine "
+                               "the two.",
+            },
             "subject": {"type": "string", "description": "Subject substring."},
             "since": {
                 "type": "string",
-                "description": "ISO date/datetime; date-only means midnight "
-                               "(server timezone).",
+                "description": "Window start: 'today', '+Nd', YYYY-MM-DD, or "
+                               "ISO datetime (server timezone).",
             },
             "until": {
                 "type": "string",
-                "description": "ISO date/datetime; date-only means midnight "
-                               "(server timezone).",
+                "description": "Window end: 'today', '+Nd', YYYY-MM-DD, or "
+                               "ISO datetime (server timezone).",
             },
             "is_unread": {"type": "boolean"},
             "has_attachments": {"type": "boolean"},
@@ -552,6 +606,11 @@ TOOLS: List[ToolSpec] = [
             "id": {"type": "string",
                    "description": "Any message id in the thread (m-alias or raw)."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "offset": {
+                "type": "integer", "minimum": 0, "default": 0,
+                "description": "History paging: 0 = the most recent entries; "
+                               "pass the returned next_offset for older ones.",
+            },
         }, required=["id"]),
         handler=_get_thread,
     ),

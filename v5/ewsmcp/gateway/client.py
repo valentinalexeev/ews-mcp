@@ -178,26 +178,29 @@ class EWSGateway:
 def paginate(query: Any, *, offset: int, limit: int,
              chunk: int = 50) -> Tuple[List[Any], Optional[int]]:
     """Materialize query[offset:offset+limit] in chunks (sync, raises on
-    mid-iteration failure — the caller's error mapper classifies it)."""
-    total: Optional[int] = None
-    count_fn = getattr(query, "count", None)
-    if callable(count_fn):
-        try:
-            total = int(count_fn())
-        except Exception:
-            total = None
+    mid-iteration failure — the caller's error mapper classifies it).
+
+    Returns ``(items, next_offset)``. NEVER calls ``QuerySet.count()`` —
+    in exchangelib that iterates every matching id server-side, so a 20k
+    inbox paid ~20k ids of round trips on every "read 10 emails". Whether
+    another page exists comes from a one-item lookahead instead; callers
+    that want an exact total use a refreshed ``folder.total_count`` (only
+    valid for unfiltered listings) or a local mirror count.
+    """
+    offset = max(0, offset)
+    limit = max(0, limit)
+    lookahead = limit + 1
     items: List[Any] = []
-    cursor = max(0, offset)
-    remaining = max(0, limit)
+    cursor = offset
     chunk = max(1, min(chunk, 250))
-    while remaining > 0:
-        want = min(chunk, remaining)
+    while len(items) < lookahead:
+        want = min(chunk, lookahead - len(items))
         batch = list(query[cursor:cursor + want])
         if not batch:
             break
         items.extend(batch)
         cursor += len(batch)
-        remaining -= len(batch)
         if len(batch) < want:
             break
-    return items, total
+    next_offset = offset + limit if len(items) > limit else None
+    return items[:limit], next_offset

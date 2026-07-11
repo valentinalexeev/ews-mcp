@@ -174,6 +174,25 @@ class IdAliaser:
             _LOG.warning("id_alias: invalid kind %r; using 'x'", kind)
             kind = "x"
         try:
+            # Read-only fast path: an existing row with no new metadata to
+            # backfill answers from a lock-free SELECT — list/search paths
+            # re-alias the same hot ids constantly and must not pay a write
+            # transaction each time (alias_many refreshes last_seen in bulk).
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT alias, changekey, internet_message_id "
+                    "FROM aliases WHERE ews_id=?", (ews_id,)
+                ).fetchone()
+            if row is not None and (
+                changekey is None or row["changekey"] == changekey
+            ) and (
+                internet_message_id is None
+                or row["internet_message_id"] == internet_message_id
+            ):
+                return row["alias"]
+        except (sqlite3.Error, OSError):
+            pass  # fall through to the write path
+        try:
             now = time.time()
             with self._lock, self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -217,6 +236,68 @@ class IdAliaser:
                 "id_alias: alias_for failed (%s); returning raw id", exc
             )
             return ews_id
+
+    def alias_many(
+        self,
+        entries: "list[tuple[str, str, Optional[str], Optional[str]]]",
+    ) -> "dict[str, str]":
+        """Bulk ``alias_for``: one transaction for a whole result page.
+
+        ``entries`` is ``[(ews_id, kind, changekey, internet_message_id)]``.
+        Returns ``{ews_id: alias}``. Runs off the event loop (callers wrap
+        card building in ``asyncio.to_thread``) so a 50-card page costs one
+        write transaction instead of fifty. Never raises on storage errors
+        — missing entries simply fall back to per-id alias_for behavior.
+        """
+        out: "dict[str, str]" = {}
+        if not entries:
+            return out
+        try:
+            now = time.time()
+            with self._lock, self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for ews_id, kind, changekey, imid in entries:
+                        if not ews_id:
+                            continue
+                        if not _KIND_RE.match(kind):
+                            kind = "x"
+                        row = conn.execute(
+                            "SELECT alias FROM aliases WHERE ews_id=?", (ews_id,)
+                        ).fetchone()
+                        if row:
+                            conn.execute(
+                                "UPDATE aliases SET last_seen=?, "
+                                "changekey=COALESCE(?, changekey), "
+                                "internet_message_id=COALESCE(?, internet_message_id) "
+                                "WHERE alias=?",
+                                (now, changekey, imid, row["alias"]),
+                            )
+                            out[ews_id] = row["alias"]
+                            continue
+                        conn.execute(
+                            "INSERT INTO counters(kind, n) VALUES (?, 1) "
+                            "ON CONFLICT(kind) DO UPDATE SET n = n + 1",
+                            (kind,),
+                        )
+                        n = conn.execute(
+                            "SELECT n FROM counters WHERE kind=?", (kind,)
+                        ).fetchone()[0]
+                        alias = f"{kind}{n}"
+                        conn.execute(
+                            "INSERT INTO aliases(alias, kind, ews_id, changekey, "
+                            "internet_message_id, first_seen, last_seen) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (alias, kind, ews_id, changekey, imid, now, now),
+                        )
+                        out[ews_id] = alias
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        except (sqlite3.Error, OSError) as exc:
+            _LOG.warning("id_alias: alias_many failed (%s); falling back", exc)
+        return out
 
     def resolve(self, value: str) -> str:
         """Translate an alias back to its raw EWS id.
@@ -336,6 +417,9 @@ class NullAliaser:
     def alias_for(self, ews_id: str, kind: str = "m", changekey=None,
                   internet_message_id=None) -> str:
         return ews_id
+
+    def alias_many(self, entries) -> dict:
+        return {e[0]: e[0] for e in entries if e and e[0]}
 
     def resolve(self, value: str) -> str:
         return value

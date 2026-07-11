@@ -26,16 +26,14 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
   items persisted via ``.save(account.drafts)`` (Exchange quotes the
   original server-side).
 - ``Item.move(folder)`` returns ``None`` and updates ``item.id`` in place.
-- ``update_messages.set_flag`` is REJECTED: 5.0.3 has no first-class
-  follow-up-flag field; pretending would be mock-drift bait.
+- There is NO follow-up-flag parameter anywhere: 5.0.3 has no first-class
+  flag field; pretending would be mock-drift bait (categories instead).
 """
 
 import html as _html
 import threading
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
 
 from exchangelib import CalendarItem, HTMLBody, Message, OofSettings
 from exchangelib.items import (
@@ -44,6 +42,7 @@ from exchangelib.items import (
     SEND_TO_NONE,
 )
 
+from ..dates import parse_when
 from ..errors import ToolError
 from .base import Context, ToolSpec
 
@@ -91,22 +90,6 @@ def _idempotency_put(key: str, record: Dict[str, Any]) -> None:
 # --- shared helpers ----------------------------------------------------------
 
 
-def parse_when(value: str, tz_name: str, field: str) -> datetime:
-    """ISO-8601 → aware datetime. Date-only → midnight in EWS_TZ; naive →
-    EWS_TZ attached. Anything else → validation error with an example."""
-    try:
-        dt = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        raise ToolError(
-            "validation",
-            f"could not parse {field}={value!r} as a datetime",
-            hint="Use ISO-8601, e.g. '2026-06-15T10:00:00+03:00' or '2026-06-15'.",
-        )
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo(tz_name))
-    return dt
-
-
 def _wrap_html(text: str) -> HTMLBody:
     """Plain text → minimal HTML (<p> per blank-line paragraph, <br/> inside)."""
     paragraphs = (text or "").split("\n\n")
@@ -144,8 +127,12 @@ def _fetch_one(account: Any, raw_id: str) -> Any:
     return item
 
 
-def _fetch_many(account: Any, raw_ids: List[str]) -> List[Any]:
-    return list(account.fetch([(i, None) for i in raw_ids]))
+def _fetch_many(account: Any, raw_ids: List[str],
+                only: Optional[List[str]] = None) -> List[Any]:
+    """Bulk fetch with a projection: without only_fields, exchangelib pulls
+    the FULL item — including base64 MIME — so a 'mark 50 read' on messages
+    with attachments used to move megabytes to flip one boolean each."""
+    return list(account.fetch([(i, None) for i in raw_ids], only_fields=only))
 
 
 def _require_bulk(ids: List[str]) -> None:
@@ -306,19 +293,12 @@ async def _delete_draft(ctx: Context, *, draft_id: str) -> Dict[str, Any]:
 
 async def _update_messages(ctx: Context, *, ids: List[str],
                            set_read: Optional[bool] = None,
-                           set_flag: Optional[str] = None,
                            categories_add: Optional[List[str]] = None,
                            categories_remove: Optional[List[str]] = None) -> Dict[str, Any]:
+    # NOTE: there is deliberately NO set_flag parameter — exchangelib 5.0.3
+    # exposes no first-class follow-up flag field, and pretending would be
+    # mock-drift bait. Categories are the visible marker (see description).
     _require_bulk(ids)
-    if set_flag is not None:
-        # Honest refusal: exchangelib 5.0.3 exposes no first-class follow-up
-        # flag field; silently no-op'ing would lie to the model.
-        raise ToolError(
-            "validation",
-            "set_flag is not yet supported by this backend "
-            "(exchangelib 5.0.3 has no first-class flag field)",
-            hint="Use categories_add (e.g. ['Follow up']) as a visible marker instead.",
-        )
     if set_read is None and not categories_add and not categories_remove:
         raise ToolError("validation",
                         "nothing to update: pass set_read and/or categories_add/_remove")
@@ -326,7 +306,9 @@ async def _update_messages(ctx: Context, *, ids: List[str],
 
     def work(account: Any) -> Dict[str, Any]:
         updated, failed = 0, []
-        for raw_id, item in zip(ids, _fetch_many(account, ids)):
+        fetched = _fetch_many(account, ids,
+                              only=["id", "changekey", "is_read", "categories"])
+        for raw_id, item in zip(ids, fetched):
             try:  # per-item isolation: one failure never aborts the batch
                 if isinstance(item, Exception):
                     raise item
@@ -357,7 +339,8 @@ async def _move_messages(ctx: Context, *, ids: List[str],
     def work(account: Any) -> Dict[str, Any]:
         folder = ctx.gateway.resolve_folder(account, to_folder, ctx.aliaser)
         moved, failed = [], []
-        for raw_id, item in zip(ids, _fetch_many(account, ids)):
+        fetched = _fetch_many(account, ids, only=["id", "changekey"])
+        for raw_id, item in zip(ids, fetched):
             try:
                 if isinstance(item, Exception):
                     raise item
@@ -402,8 +385,8 @@ async def _create_event(ctx: Context, *, subject: str, start: str, end: str,
             hint="Save the event without invitations, or have the operator "
                  "flip SEND_ENABLED.",
         )
-    start_dt = parse_when(start, ctx.settings.ews_tz, "start")
-    end_dt = parse_when(end, ctx.settings.ews_tz, "end")
+    start_dt = parse_when(start, "start", ctx.settings.ews_tz)
+    end_dt = parse_when(end, "end", ctx.settings.ews_tz)
     if end_dt <= start_dt:
         raise ToolError("validation", "end must be after start")
 
@@ -445,8 +428,8 @@ async def _update_event(ctx: Context, *, event_id: str,
     if all(v is None for v in (subject, start, end, location, body)):
         raise ToolError("validation",
                         "nothing to update: pass subject/start/end/location/body")
-    start_dt = parse_when(start, ctx.settings.ews_tz, "start") if start else None
-    end_dt = parse_when(end, ctx.settings.ews_tz, "end") if end else None
+    start_dt = parse_when(start, "start", ctx.settings.ews_tz) if start else None
+    end_dt = parse_when(end, "end", ctx.settings.ews_tz) if end else None
 
     def work(account: Any) -> Dict[str, Any]:
         item = _fetch_one(account, event_id)
@@ -594,8 +577,8 @@ async def _set_oof(ctx: Context, *, state: str,
         raise ToolError("validation", f"internal_reply is required when state={state!r}")
     if state == "scheduled" and not (start and end):
         raise ToolError("validation", "start and end are required when state='scheduled'")
-    start_dt = parse_when(start, ctx.settings.ews_tz, "start") if start else None
-    end_dt = parse_when(end, ctx.settings.ews_tz, "end") if end else None
+    start_dt = parse_when(start, "start", ctx.settings.ews_tz) if start else None
+    end_dt = parse_when(end, "end", ctx.settings.ews_tz) if end else None
 
     def work(account: Any) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {"state": target_state}
@@ -639,7 +622,8 @@ async def _delete_messages(ctx: Context, *, ids: List[str],
 
     def work(account: Any) -> Dict[str, Any]:
         deleted, failed = 0, []
-        for raw_id, item in zip(ids, _fetch_many(account, ids)):
+        fetched = _fetch_many(account, ids, only=["id", "changekey"])
+        for raw_id, item in zip(ids, fetched):
             try:
                 if isinstance(item, Exception):
                     raise item
@@ -721,13 +705,12 @@ TOOLS: List[ToolSpec] = [
         description=(
             "Bulk-update up to 50 messages: set_read and/or categories_add/"
             "categories_remove. Per-item failures are isolated and reported. "
-            "set_flag is NOT yet supported (no flag field in the backend) and "
-            "is rejected with a validation error."
+            "There is no follow-up-flag support in this backend — use "
+            "categories_add (e.g. ['Follow up']) as the visible marker."
         ),
         side_effect_class="write",
         input_schema=_obj({
             "ids": _IDS, "set_read": _BOOL,
-            "set_flag": {"type": "string", "enum": ["flagged", "complete", "none"]},
             "categories_add": _EMAILS, "categories_remove": _EMAILS,
         }, required=["ids"]),
         handler=_update_messages,

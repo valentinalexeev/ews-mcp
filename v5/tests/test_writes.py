@@ -58,7 +58,11 @@ def make_account():
     account.drafts = SimpleNamespace(id=DRAFTS_ID, name="Drafts")
     account.calendar = SimpleNamespace(id="FOLDER-CAL")
     account._by_id = {}
-    account.fetch = lambda pairs: [account._by_id[i] for i, _ in pairs]
+    account.fetch_projections = []
+    def fetch(pairs, only_fields=None):
+        account.fetch_projections.append(only_fields)
+        return [account._by_id[i] for i, _ in pairs]
+    account.fetch = fetch
     return account
 
 

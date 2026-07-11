@@ -38,6 +38,9 @@ class _Query(list):
         self.filter_calls = []
         self.only_calls = []
         self.order_calls = []
+        self.count_calls = 0
+        self.refresh_calls = 0
+        self.total_count = len(items)
 
     def filter(self, *args, **kwargs):
         self.filter_calls.append((args, kwargs))
@@ -52,7 +55,12 @@ class _Query(list):
         return self
 
     def count(self):
+        # The perf contract says this must NEVER run (full-folder scan).
+        self.count_calls += 1
         return len(self)
+
+    def refresh(self):
+        self.refresh_calls += 1
 
 
 class _FakeGateway:
@@ -194,8 +202,43 @@ def test_search_pagination_next_offset(tmp_path):
     ctx = _ctx(tmp_path, _account(inbox=inbox))
     res = _run(ctx, "search_messages", limit=2)
     assert res["count"] == 2
+    # Unfiltered listing: the exact total comes from the REFRESHED folder
+    # property, never from a count() full-folder scan.
     assert res["total_available"] == 3
     assert res["next_offset"] == 2
+    assert inbox.refresh_calls == 1
+    assert inbox.count_calls == 0
+
+
+def test_search_never_calls_queryset_count(tmp_path):
+    """count() iterates every matching id server-side — banned on all
+    search paths (the v3 latency root cause)."""
+    inbox = _Query([_msg(f"RAW-{n}=") for n in range(5)])
+    ctx = _ctx(tmp_path, _account(inbox=inbox))
+    _run(ctx, "search_messages", subject="x", limit=2)
+    _run(ctx, "search_messages", limit=2)
+    assert inbox.count_calls == 0
+
+
+def test_search_filtered_has_lookahead_next_offset_but_no_total(tmp_path):
+    inbox = _Query([_msg(f"RAW-{n}=") for n in range(4)])
+    ctx = _ctx(tmp_path, _account(inbox=inbox))
+    res = _run(ctx, "search_messages", subject="Subj", limit=2)
+    assert res["total_available"] is None  # filtered: total would need a scan
+    assert res["next_offset"] == 2  # lookahead saw a third item
+    assert inbox.refresh_calls == 0  # refresh only pays off unfiltered
+
+
+def test_search_sender_param_and_deprecated_alias(tmp_path):
+    inbox = _Query([
+        _msg("RAW-1=", sender="ahmed@corp.example"),
+        _msg("RAW-2=", sender="sara@corp.example"),
+    ])
+    ctx = _ctx(tmp_path, _account(inbox=inbox))
+    res = _run(ctx, "search_messages", sender="ahmed")
+    assert res["count"] == 1
+    both = _run(ctx, "search_messages", sender="ahmed", from_="ahmed")
+    assert both["error"]["code"] == "validation"
 
 
 # --- get_message -----------------------------------------------------------------
@@ -297,6 +340,26 @@ def test_get_thread_caps_at_limit_keeping_latest(tmp_path):
     res = _run(ctx, "get_thread", id="RAW-0=", limit=2)
     assert res["count"] == 2 and res["total_available"] == 4
     assert [entry["body"] for entry in res["items"]] == ["entry 2", "entry 3"]
+    assert res["next_offset"] == 2  # older history exists
+
+
+def test_get_thread_offset_pages_older_history(tmp_path):
+    msgs = [
+        _msg(f"RAW-{n}=", dt=datetime(2026, 6, 10, 8 + n, 0, tzinfo=TZ),
+             text_body=f"entry {n}")
+        for n in range(5)
+    ]
+    account = _account(inbox=_Query(msgs), sent=_Query())
+    account.fetch = MagicMock(return_value=[msgs[0]])
+    ctx = _ctx(tmp_path, account)
+    older = _run(ctx, "get_thread", id="RAW-0=", limit=2, offset=2)
+    assert [e["body"] for e in older["items"]] == ["entry 1", "entry 2"]
+    assert older["next_offset"] == 4
+    oldest = _run(ctx, "get_thread", id="RAW-0=", limit=2, offset=4)
+    assert [e["body"] for e in oldest["items"]] == ["entry 0"]
+    assert oldest["next_offset"] is None
+    # participants always count the WHOLE thread, not the returned page
+    assert sum(p["msgs"] for p in oldest["participants"]) == 5
 
 
 # --- get_attachment --------------------------------------------------------------

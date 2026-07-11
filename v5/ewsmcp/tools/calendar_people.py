@@ -18,48 +18,39 @@ exchangelib 5.0.3 shapes verified against the installed library:
   ErrorNameResolutionNoResults) — those mean "no match", skip them.
 """
 
-import re
 import time
 from datetime import datetime, time as dtime, timedelta
+from itertools import islice
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 from .. import __version__
 from ..bodyclean import clean_body, html_to_text
+from ..dates import parse_when
 from ..dto import envelope, event_card, fmt_dt
 from ..errors import ToolError
 from .base import Context, ToolSpec
 
 GRID_MINUTES = 30  # free/busy slot granularity
 WORKING_HOURS = (dtime(9, 0), dtime(17, 0))
-_REL_RE = re.compile(r"^\+(\d{1,4})d$")
+MAX_WINDOW_DAYS = 366  # reject absurd windows like '+9999d' before EWS does
+MAX_CONTACT_SCAN = 1000  # cap the personal-contacts substring scan
+_CONTACT_FIELDS = ("display_name", "email_addresses", "job_title",
+                   "company_name", "phone_numbers")
 
 
-# ---------------------------------------------------------------- dates
-
-
-def _parse_when(value: Any, field: str, tz_name: str) -> datetime:
-    """'today' → local midnight; '+Nd' → today+N days midnight; ISO date
-    → midnight; ISO datetime → as given (naive gets the server tz)."""
-    tz = ZoneInfo(tz_name)
-    if not isinstance(value, str) or not value.strip():
-        raise ToolError("validation", f"{field!r} must be a non-empty date string.",
-                        hint="Use 'today', '+Nd', YYYY-MM-DD, or an ISO datetime.")
-    v = value.strip()
-    midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
-    if v.lower() == "today":
-        return midnight
-    m = _REL_RE.match(v)
-    if m:
-        return midnight + timedelta(days=int(m.group(1)))
-    try:
-        dt = datetime.fromisoformat(v)  # date-only parses to midnight
-    except ValueError:
+def _window(start: str, end: str, tz: str) -> Tuple[datetime, datetime]:
+    start_dt = parse_when(start, "start", tz)
+    end_dt = parse_when(end, "end", tz)
+    if end_dt <= start_dt:
+        raise ToolError("validation", "'end' must be after 'start'.",
+                        hint="Example: start='today', end='+7d'.")
+    if end_dt - start_dt > timedelta(days=MAX_WINDOW_DAYS):
         raise ToolError(
-            "validation", f"{field!r}: cannot parse {value!r} as a date.",
-            hint="Use 'today', '+Nd' (e.g. '+7d'), YYYY-MM-DD, or an ISO datetime.",
-        ) from None
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=tz)
+            "validation",
+            f"window is longer than {MAX_WINDOW_DAYS} days — narrow it.",
+            hint="Query a year at most per call; page by moving 'start'.",
+        )
+    return start_dt, end_dt
 
 
 def _ceil_to_grid(dt: datetime, step_minutes: int = GRID_MINUTES) -> datetime:
@@ -113,24 +104,29 @@ def merge_busy_and_find_slots(
 async def _list_events(ctx: Context, start: str = "today", end: str = "+7d",
                        offset: int = 0, limit: int = 25) -> Dict[str, Any]:
     tz = ctx.settings.ews_tz
-    start_dt = _parse_when(start, "start", tz)
-    end_dt = _parse_when(end, "end", tz)
-    if end_dt <= start_dt:
-        raise ToolError("validation", "'end' must be after 'start'.",
-                        hint="Example: start='today', end='+7d'.")
+    start_dt, end_dt = _window(start, end, tz)
+    offset = max(0, int(offset))
+    limit = max(0, int(limit))
+    cap = offset + limit + 1  # lookahead: is there a page after this one?
 
     def work(account: Any) -> List[Any]:
         # .view() implements CalendarView: it EXPANDS recurring events into
         # occurrences overlapping the window. .filter() would return only
         # recurrence masters — wrong for a calendar listing. Never swap.
-        return list(account.calendar.view(start=start_dt, end=end_dt))
+        # max_items caps the expansion server-side (a year of recurrences
+        # is not materialized just to render page one).
+        return list(account.calendar.view(start=start_dt, end=end_dt,
+                                          max_items=cap))
 
     items = await ctx.gateway.call(work)
-    total = len(items)  # cheaply known: the view is already materialized
-    offset = max(0, int(offset))
-    page = items[offset:offset + max(0, int(limit))]
+    truncated = len(items) >= cap
+    total = None if truncated else len(items)
+    page = items[offset:offset + limit]
+    next_offset = offset + limit if truncated or offset + limit < len(items) else None
+    if next_offset is not None and not page:
+        next_offset = None
     cards = [event_card(item, ctx.aliaser, tz) for item in page]
-    return envelope(cards, total, offset)
+    return envelope(cards, total, offset, next_offset=next_offset)
 
 
 def _attendee_entries(item: Any) -> List[Dict[str, Any]]:
@@ -188,10 +184,7 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
         raise ToolError("validation", "'attendees' must list at least one email.")
     if int(duration_minutes) <= 0:
         raise ToolError("validation", "'duration_minutes' must be positive.")
-    start_dt = _parse_when(start, "start", tz)
-    end_dt = _parse_when(end, "end", tz)
-    if end_dt <= start_dt:
-        raise ToolError("validation", "'end' must be after 'start'.")
+    start_dt, end_dt = _window(start, end, tz)
     requests = [(email, "Required", False) for email in emails]
 
     def work(account: Any) -> List[Any]:
@@ -199,11 +192,17 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
             accounts=requests, start=start_dt, end=end_dt))
 
     views = await ctx.gateway.call(work)
-    per_attendee: Dict[str, List[Dict[str, Any]]] = {}
+    per_attendee: Dict[str, Any] = {}
     busy_by_attendee: Dict[str, List[Tuple[datetime, datetime]]] = {}
+    degraded: List[str] = []
     for email, view in zip(emails, views):
         if isinstance(view, Exception):
-            raise view
+            # One unresolvable attendee (external address, hidden calendar)
+            # degrades THAT entry, never the whole call. Their busy state is
+            # unknown, so slots are computed from the remaining attendees.
+            per_attendee[email] = {"error": f"{type(view).__name__}: {view}"}
+            degraded.append(email)
+            continue
         entries: List[Dict[str, Any]] = []
         blocks: List[Tuple[datetime, datetime]] = []
         for ev in getattr(view, "calendar_events", None) or []:
@@ -218,11 +217,23 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
                 blocks.append((ev_start, ev_end))
         per_attendee[email] = entries
         busy_by_attendee[email] = blocks
+    if not busy_by_attendee:
+        raise ToolError(
+            "upstream_error",
+            "free/busy failed for every requested attendee",
+            hint="Check the addresses; external calendars may be hidden.",
+        )
     hours = WORKING_HOURS if working_hours_only else None
     raw = merge_busy_and_find_slots(busy_by_attendee, start_dt, end_dt,
                                     int(duration_minutes), hours)
     slots = [{"start": fmt_dt(s, tz), "end": fmt_dt(e, tz)} for s, e in raw]
-    return {"ok": True, "slots": slots, "per_attendee": per_attendee}
+    out: Dict[str, Any] = {"ok": True, "slots": slots, "per_attendee": per_attendee}
+    if degraded:
+        out["warnings"] = [
+            f"free/busy unavailable for: {', '.join(degraded)} — slots "
+            "ignore their calendars"
+        ]
+    return out
 
 
 def _gal_person(entry: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -288,7 +299,15 @@ async def _find_people(ctx: Context, query: str, source: str = "auto",
             gal = list(account.protocol.resolve_names(
                 [q], return_full_contact_data=True))
         if source in ("auto", "contacts"):
-            for contact in account.contacts.all():
+            qs = account.contacts.all()
+            try:
+                # Projection: the substring scan needs five fields, not
+                # whole Contact items. Best-effort — mocks/odd folders may
+                # not support .only().
+                qs = qs.only(*_CONTACT_FIELDS)
+            except Exception:
+                pass
+            for contact in islice(qs, MAX_CONTACT_SCAN):
                 name = str(getattr(contact, "display_name", "") or "")
                 emails = [str(getattr(e, "email", "") or "") for e in
                           (getattr(contact, "email_addresses", None) or [])]
