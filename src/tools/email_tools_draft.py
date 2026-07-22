@@ -240,14 +240,22 @@ class CreateReplyDraftTool(BaseTool):
                 if r and hasattr(r, "email_address") and r.email_address
             ]
 
+            # Mirror standard reply-all semantics: sender + original To stay in
+            # To; original Cc recipients stay in Cc rather than being promoted.
+            reply_cc_recipients = []
             if reply_all:
                 seen = set()
                 reply_to_recipients = []
-                for email in [original_from_email] + original_to + original_cc:
+                for email in [original_from_email] + original_to:
                     if not email or email == account.primary_smtp_address or email in seen:
                         continue
                     seen.add(email)
                     reply_to_recipients.append(Mailbox(email_address=email))
+                for email in original_cc:
+                    if not email or email == account.primary_smtp_address or email in seen:
+                        continue
+                    seen.add(email)
+                    reply_cc_recipients.append(Mailbox(email_address=email))
             else:
                 reply_to_recipients = [Mailbox(email_address=original_from_email)]
 
@@ -288,6 +296,7 @@ class CreateReplyDraftTool(BaseTool):
                 subject=reply_subject,
                 body=HTMLBody(complete_body),
                 to_recipients=reply_to_recipients,
+                cc_recipients=reply_cc_recipients or None,
                 folder=account.drafts,
             )
 

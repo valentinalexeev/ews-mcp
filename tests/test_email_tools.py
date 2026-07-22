@@ -112,7 +112,7 @@ async def test_create_reply_draft_tool_saves_html_draft(mock_ews_client):
 
 @pytest.mark.asyncio
 async def test_create_reply_draft_tool_reply_all_uses_all_recipients(mock_ews_client):
-    """Test reply-all draft includes sender and original recipients except self."""
+    """Reply-all mirrors the original: sender + To stay in To, Cc stays in Cc, self excluded."""
     tool = CreateReplyDraftTool(mock_ews_client)
     mock_ews_client.get_account = Mock(return_value=mock_ews_client.account)
     mock_ews_client.account.drafts = MagicMock()
@@ -154,8 +154,10 @@ async def test_create_reply_draft_tool_reply_all_uses_all_recipients(mock_ews_cl
             )
 
     called_kwargs = mock_message.call_args.kwargs
-    recipients = [recipient.email_address for recipient in called_kwargs["to_recipients"]]
-    assert recipients == ["sender@example.com", "team@example.com", "other@example.com"]
+    to_addresses = [recipient.email_address for recipient in called_kwargs["to_recipients"]]
+    cc_addresses = [recipient.email_address for recipient in (called_kwargs["cc_recipients"] or [])]
+    assert to_addresses == ["sender@example.com", "team@example.com"]
+    assert cc_addresses == ["other@example.com"]
 
 
 @pytest.mark.asyncio
