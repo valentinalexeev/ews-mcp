@@ -450,7 +450,19 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
             except Exception:
                 total = None
         qs = target.filter(query) if query else target.filter(**filters)
-        page, next_off = paginate(_project(qs), offset=offset, limit=limit)
+        if total is None and categories and not query:
+            # Live-verified: qs.count() on a categories__contains restriction
+            # is cheap (server-side count, not a full fetch) and accurate -
+            # worth paying for here since callers filtering by category are
+            # exactly the ones that need a real total_available (e.g. a Qx
+            # dashboard counting messages per label), not just a page of
+            # items to display.
+            try:
+                total = qs.count()
+            except Exception:
+                total = None
+        qs = _project(qs)
+        page, next_off = paginate(qs, offset=offset, limit=limit)
         return page, next_off, total
 
     items, next_offset, total = await ctx.gateway.call(work)
