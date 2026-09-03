@@ -352,6 +352,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                            until: Optional[str] = None, is_unread: Optional[bool] = None,
                            has_attachments: Optional[bool] = None,
                            categories: Optional[List[str]] = None,
+                           recursive: bool = False,
                            offset: int = 0, limit: int = 20,
                            mode: str = "keyword",
                            fresh: bool = False) -> Dict[str, Any]:
@@ -395,8 +396,14 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     tz = ctx.settings.ews_tz
 
     # ---- cache-first: local FTS + SQL filters, exact COUNT(*) total -------
+    # `recursive` always goes live: the mirror only tracks a fixed, flat set
+    # of synced folders (EWS_CACHE_FOLDERS), not "this folder plus whatever
+    # subfolder tree it happens to have" - there's no cheap way to know
+    # which cached folder keys are actually descendants of `folder` without
+    # a live folder-hierarchy lookup, which defeats the point of the cache
+    # path being fast.
     folder_key = _cache_folder_key(ctx, folder)
-    if not fresh and folder_key:
+    if not fresh and not recursive and folder_key:
         as_of = _cache_watermark(ctx, folder_key)
         if as_of:
             try:
@@ -441,7 +448,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     def work(account: Any) -> Tuple[List[Any], Optional[int], Optional[int]]:
         target = ctx.gateway.resolve_folder(account, folder, ctx.aliaser)
         total: Optional[int] = None
-        if unfiltered:
+        if unfiltered and not recursive:
             # Exact totals are only cheap for a plain listing: one refreshed
             # folder property instead of a count() full-folder scan.
             try:
@@ -449,14 +456,38 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                 total = getattr(target, "total_count", None)
             except Exception:
                 total = None
-        qs = target.filter(query) if query else target.filter(**filters)
-        if total is None and categories and not query:
+        if recursive:
+            # Searches `target` AND every folder under it in ONE EWS request
+            # (exchangelib's FolderCollection.filter() issues a single
+            # FindItem call across all member folders) - the alternative,
+            # discovering subfolders and issuing one search_messages call
+            # per folder from the CALLER's side, doesn't scale: a mailbox
+            # with ~100 inbox subfolders turns one Qx-style "count per
+            # category" refresh into ~900 separate tool calls. Local import:
+            # this is the only place in the tool pack that needs it.
+            from exchangelib import FolderCollection
+            scope = FolderCollection(account=account, folders=[target, *target.walk()])
+        else:
+            scope = target
+        qs = scope.filter(query) if query else scope.filter(**filters)
+        if total is None and categories and not recursive and not query:
             # Live-verified: qs.count() on a categories__contains restriction
-            # is cheap (server-side count, not a full fetch) and accurate -
-            # worth paying for here since callers filtering by category are
-            # exactly the ones that need a real total_available (e.g. a Qx
-            # dashboard counting messages per label), not just a page of
-            # items to display.
+            # against a SINGLE folder is cheap (server-side count, not a
+            # full fetch) and accurate - worth paying for here since callers
+            # filtering by category are exactly the ones that need a real
+            # total_available (e.g. a Qx dashboard counting messages per
+            # label), not just a page of items to display.
+            #
+            # Deliberately NOT extended to `recursive`: qs.count() on a
+            # multi-folder FolderCollection is live-verified WRONG (returns
+            # roughly the size of a single member folder, not the union) -
+            # this is a known exchangelib limitation, not something fixable
+            # here (see ecederstrand/exchangelib#1022, "multi-folder search"
+            # issues). Per-item results across a recursive scope ARE correct
+            # (ground-truth-verified), just not qs.count(). Leaving total
+            # as None for recursive searches is deliberate: it signals
+            # "don't trust this" to callers rather than returning a
+            # plausible-looking wrong number.
             try:
                 total = qs.count()
             except Exception:
@@ -937,6 +968,25 @@ TOOLS: List[ToolSpec] = [
                 "description": "Match messages carrying ALL of these Outlook "
                                "categories (exact names, e.g. ['Q1']). Cannot "
                                "combine with `query`.",
+            },
+            "recursive": {
+                "type": "boolean", "default": False,
+                "description": "Search `folder` AND every folder under it, in "
+                               "one request (via exchangelib's FolderCollection - "
+                               "not a per-folder loop). Use this instead of "
+                               "discovering subfolders and calling "
+                               "search_messages once per folder, which doesn't "
+                               "scale for a mailbox with many subfolders. "
+                               "Combines with `query` OR the structured filters. "
+                               "Always forces a live read (fresh=true) - the "
+                               "local mirror only tracks a fixed set of synced "
+                               "folders, not arbitrary subtrees. CAVEAT: "
+                               "total_available is always null for a recursive "
+                               "search - counting across multiple folders is "
+                               "unreliable in the underlying library, so this "
+                               "only returns individual items (each still "
+                               "correct), never a trustworthy total. Do not "
+                               "rely on total_available when recursive=true.",
             },
             "offset": {"type": "integer", "minimum": 0, "default": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
