@@ -27,8 +27,11 @@ from ..bodyclean import clean_body
 from ..dates import parse_when
 from ..dto import envelope, event_card, fmt_dt, msg_card, msg_full
 from ..errors import ToolError
+from ..flag_property import ensure_registered as ensure_flag_status_registered
 from ..gateway.client import WELL_KNOWN, paginate
 from .base import Context, ToolSpec
+
+ensure_flag_status_registered()
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +356,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                            has_attachments: Optional[bool] = None,
                            categories: Optional[List[str]] = None,
                            recursive: bool = False,
+                           flag_complete: Optional[bool] = None,
                            offset: int = 0, limit: int = 20,
                            mode: str = "keyword",
                            fresh: bool = False) -> Dict[str, Any]:
@@ -381,13 +385,14 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     sender = sender or from_
     structured_given = any(
         v is not None for v in
-        (sender, subject, since, until, is_unread, has_attachments, categories)
+        (sender, subject, since, until, is_unread, has_attachments, categories, flag_complete)
     )
     if query and structured_given:
         raise ToolError(
             "validation",
             "`query` (AQS) cannot be combined with the structured filters "
-            "(sender/subject/since/until/is_unread/has_attachments/categories) — "
+            "(sender/subject/since/until/is_unread/has_attachments/categories/"
+            "flag_complete) — "
             "Exchange runs them on different engines.",
             hint="Either fold everything into the AQS string "
                  "(e.g. 'from:ahmed subject:rfp received>=2026-06-01') or drop "
@@ -401,9 +406,12 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     # subfolder tree it happens to have" - there's no cheap way to know
     # which cached folder keys are actually descendants of `folder` without
     # a live folder-hierarchy lookup, which defeats the point of the cache
-    # path being fast.
+    # path being fast. `flag_complete` also always goes live: the mirror's
+    # schema has no column for it (flag_status is an extended property the
+    # sync engine never fetches/stores), so a cached search can't filter on
+    # it either.
     folder_key = _cache_folder_key(ctx, folder)
-    if not fresh and not recursive and folder_key:
+    if not fresh and not recursive and flag_complete is None and folder_key:
         as_of = _cache_watermark(ctx, folder_key)
         if as_of:
             try:
@@ -442,8 +450,10 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
         filters["is_read"] = not is_unread
     if has_attachments is not None:
         filters["has_attachments"] = bool(has_attachments)
+    if flag_complete is True:
+        filters["flag_status"] = 1
 
-    unfiltered = not query and not filters and not sender
+    unfiltered = not query and not filters and not sender and flag_complete is None
 
     def work(account: Any) -> Tuple[List[Any], Optional[int], Optional[int]]:
         target = ctx.gateway.resolve_folder(account, folder, ctx.aliaser)
@@ -470,13 +480,20 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
         else:
             scope = target
         qs = scope.filter(query) if query else scope.filter(**filters)
-        if total is None and categories and not recursive and not query:
-            # Live-verified: qs.count() on a categories__contains restriction
-            # against a SINGLE folder is cheap (server-side count, not a
-            # full fetch) and accurate - worth paying for here since callers
-            # filtering by category are exactly the ones that need a real
-            # total_available (e.g. a Qx dashboard counting messages per
-            # label), not just a page of items to display.
+        if flag_complete is False:
+            # "Not complete" covers both never-flagged (None) and
+            # flagged-but-still-open (2) - only excluding the explicit
+            # complete value (1) captures both correctly.
+            qs = qs.exclude(flag_status=1)
+        if (total is None and not recursive and not query
+                and (categories or flag_complete is not None)):
+            # Live-verified: qs.count() on a categories__contains or
+            # flag_status restriction against a SINGLE folder is cheap
+            # (server-side count, not a full fetch) and accurate - worth
+            # paying for here since callers filtering this way are exactly
+            # the ones that need a real total_available (e.g. a Qx
+            # dashboard counting messages per label, or messages still
+            # outstanding), not just a page of items to display.
             #
             # Deliberately NOT extended to `recursive`: qs.count() on a
             # multi-folder FolderCollection is live-verified WRONG (returns
@@ -919,7 +936,8 @@ TOOLS: List[ToolSpec] = [
             "Search mail. TWO ENGINES, mutually exclusive: pass `query` (an "
             "Exchange AQS string, e.g. 'from:ahmed subject:rfp hasattachment:yes') "
             "OR the structured filters (sender/subject/since/until/is_unread/"
-            "has_attachments/categories) — combining `query` with any structured filter is "
+            "has_attachments/categories/flag_complete) — combining `query` with any "
+            "structured filter is "
             "a validation error. `sender` is matched client-side against the "
             "fetched page's sender email/name, so total_available is unknown "
             "when it is used. Results are compact cards, newest first; their "
@@ -987,6 +1005,15 @@ TOOLS: List[ToolSpec] = [
                                "only returns individual items (each still "
                                "correct), never a trustworthy total. Do not "
                                "rely on total_available when recursive=true.",
+            },
+            "flag_complete": {
+                "type": "boolean",
+                "description": "true: only messages whose follow-up flag is marked "
+                               "Complete. false: only messages that are NOT marked "
+                               "Complete (covers both unflagged and still-open-flagged "
+                               "messages). Cannot combine with `query`. Always forces "
+                               "a live read (fresh=true) - the local mirror doesn't "
+                               "track this field.",
             },
             "offset": {"type": "integer", "minimum": 0, "default": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
