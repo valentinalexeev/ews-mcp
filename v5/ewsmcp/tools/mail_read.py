@@ -351,6 +351,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                            subject: Optional[str] = None, since: Optional[str] = None,
                            until: Optional[str] = None, is_unread: Optional[bool] = None,
                            has_attachments: Optional[bool] = None,
+                           categories: Optional[List[str]] = None,
                            offset: int = 0, limit: int = 20,
                            mode: str = "keyword",
                            fresh: bool = False) -> Dict[str, Any]:
@@ -378,14 +379,15 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                         "pass `sender` only — `from_` is its deprecated alias.")
     sender = sender or from_
     structured_given = any(
-        v is not None for v in (sender, subject, since, until, is_unread, has_attachments)
+        v is not None for v in
+        (sender, subject, since, until, is_unread, has_attachments, categories)
     )
     if query and structured_given:
         raise ToolError(
             "validation",
             "`query` (AQS) cannot be combined with the structured filters "
-            "(sender/subject/since/until/is_unread/has_attachments) — Exchange "
-            "runs them on different engines.",
+            "(sender/subject/since/until/is_unread/has_attachments/categories) — "
+            "Exchange runs them on different engines.",
             hint="Either fold everything into the AQS string "
                  "(e.g. 'from:ahmed subject:rfp received>=2026-06-01') or drop "
                  "`query` and use only structured filters.",
@@ -407,6 +409,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                     folders=[folder_key], text=query, sender=sender,
                     subject=subject, since_ts=since_ts, until_ts=until_ts,
                     is_unread=is_unread, has_attachments=has_attachments,
+                    categories=categories,
                     offset=offset, limit=limit,
                 )
                 cards = await asyncio.to_thread(
@@ -422,6 +425,8 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     filters: Dict[str, Any] = {}
     if subject:
         filters["subject__icontains"] = subject
+    if categories:
+        filters["categories__contains"] = categories
     if since:
         filters["datetime_received__gte"] = parse_when(since, "since", tz)
     if until:
@@ -871,7 +876,7 @@ TOOLS: List[ToolSpec] = [
             "Search mail. TWO ENGINES, mutually exclusive: pass `query` (an "
             "Exchange AQS string, e.g. 'from:ahmed subject:rfp hasattachment:yes') "
             "OR the structured filters (sender/subject/since/until/is_unread/"
-            "has_attachments) — combining `query` with any structured filter is "
+            "has_attachments/categories) — combining `query` with any structured filter is "
             "a validation error. `sender` is matched client-side against the "
             "fetched page's sender email/name, so total_available is unknown "
             "when it is used. Results are compact cards, newest first; their "
@@ -914,6 +919,13 @@ TOOLS: List[ToolSpec] = [
             },
             "is_unread": {"type": "boolean"},
             "has_attachments": {"type": "boolean"},
+            "categories": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Match messages carrying ALL of these Outlook "
+                               "categories (exact names, e.g. ['Q1']). Cannot "
+                               "combine with `query`.",
+            },
             "offset": {"type": "integer", "minimum": 0, "default": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
             "mode": {
